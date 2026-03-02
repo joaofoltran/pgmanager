@@ -21,7 +21,6 @@ const modules = [
     path: "/backup",
     icon: HardDrive,
     description: "Backup & restore",
-    soon: true,
   },
   {
     name: "Standby",

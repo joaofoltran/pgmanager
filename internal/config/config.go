@@ -95,6 +95,21 @@ type LoggingConfig struct {
 	Format string // "json" or "console"
 }
 
+// FilterConfig holds table/schema filtering rules for migration.
+type FilterConfig struct {
+	IncludeSchemas    []string
+	ExcludeSchemas    []string
+	IncludeTables     []string
+	ExcludeTables     []string
+	ExcludeExtensions []string
+}
+
+// SchemaConfig holds settings for DDL handling.
+type SchemaConfig struct {
+	MaxErrors         int
+	ExcludeExtensions []string
+}
+
 // Config is the top-level configuration for pgmanager.
 type Config struct {
 	Source      DatabaseConfig
@@ -102,6 +117,8 @@ type Config struct {
 	Replication ReplicationConfig
 	Snapshot    SnapshotConfig
 	Logging     LoggingConfig
+	Filter      FilterConfig
+	Schema      SchemaConfig
 }
 
 // Validate checks that required fields are present and values are sane.

@@ -17,6 +17,7 @@ export interface Cluster {
   name: string;
   nodes: ClusterNode[];
   tags?: string[];
+  backup_path?: string;
   created_at: string;
   updated_at: string;
 }

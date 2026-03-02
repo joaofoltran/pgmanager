@@ -21,6 +21,7 @@ const (
 	copyThreshold   = 5
 	coalesceTxLimit = 500
 	coalesceMaxWait = 50 * time.Millisecond
+	maxTxBytes      = 256 * 1024 * 1024
 )
 
 // Applier reads Messages from a channel and applies DML to the destination.
@@ -33,9 +34,13 @@ type Applier struct {
 
 	relations map[uint32]*stream.RelationMessage
 	stmtCache map[string]string
+	matviews  map[string]bool
 
 	txCount   int64
+	txBytes   int64
 	lastLogAt time.Time
+
+	filterFn func(namespace, table string) bool
 }
 
 // NewApplier creates an Applier that writes to the given connection pool.
@@ -45,7 +50,45 @@ func NewApplier(pool *pgxpool.Pool, logger zerolog.Logger) *Applier {
 		logger:    logger.With().Str("component", "applier").Logger(),
 		relations: make(map[uint32]*stream.RelationMessage),
 		stmtCache: make(map[string]string),
+		matviews:  make(map[string]bool),
 	}
+}
+
+// SetFilter sets a function that returns true if the given table should be applied.
+// Messages for tables where filterFn returns false are silently skipped.
+func (a *Applier) SetFilter(fn func(namespace, table string) bool) {
+	a.filterFn = fn
+}
+
+// SetMatViews provides a set of materialized view names (schema.name) to skip during replay.
+func (a *Applier) SetMatViews(views map[string]bool) {
+	a.matviews = views
+}
+
+func (a *Applier) shouldSkip(namespace, table string) bool {
+	key := namespace + "." + table
+	if a.matviews[key] {
+		return true
+	}
+	if a.filterFn != nil && !a.filterFn(namespace, table) {
+		return true
+	}
+	return false
+}
+
+func estimateParamBytes(vals []any) int64 {
+	var n int64
+	for _, v := range vals {
+		switch s := v.(type) {
+		case string:
+			n += int64(len(s))
+		case []byte:
+			n += int64(len(s))
+		default:
+			n += 8
+		}
+	}
+	return n
 }
 
 // OnApplied is a callback invoked after a commit message has been applied.
@@ -147,6 +190,7 @@ func (a *Applier) Start(ctx context.Context, messages <-chan stream.Message, onA
 		}
 		pendingCommits = pendingCommits[:0]
 		coalescedTx = 0
+		a.txBytes = 0
 		return nil
 	}
 
@@ -196,6 +240,10 @@ func (a *Applier) Start(ctx context.Context, messages <-chan stream.Message, onA
 					continue
 				}
 
+				if a.shouldSkip(m.Namespace, m.Table) {
+					continue
+				}
+
 				if m.Op == stream.OpInsert {
 					if batch.len() > 0 && !batch.matches(m) {
 						if err := a.flushBatch(ctx, tx, &batch); err != nil {
@@ -218,15 +266,21 @@ func (a *Applier) Start(ctx context.Context, messages <-chan stream.Message, onA
 					return rollbackAndFail(err)
 				}
 
-				var err error
+				var applyErr error
 				switch m.Op {
 				case stream.OpUpdate:
-					err = a.applyUpdate(ctx, tx, m)
+					applyErr = a.applyUpdate(ctx, tx, m)
 				case stream.OpDelete:
-					err = a.applyDelete(ctx, tx, m)
+					applyErr = a.applyDelete(ctx, tx, m)
 				}
-				if err != nil {
-					return rollbackAndFail(fmt.Errorf("apply %s on %s.%s: %w", m.Op, m.Namespace, m.Table, err))
+				if applyErr != nil {
+					return rollbackAndFail(fmt.Errorf("apply %s on %s.%s: %w", m.Op, m.Namespace, m.Table, applyErr))
+				}
+
+				if a.txBytes > maxTxBytes {
+					if err := commitCoalesced(); err != nil {
+						return err
+					}
 				}
 
 			case *stream.CommitMessage:
@@ -312,6 +366,7 @@ func (a *Applier) flushBatchExec(ctx context.Context, tx pgx.Tx, batch *insertBa
 	if err != nil {
 		return fmt.Errorf("insert into %s.%s (%d rows): %w", batch.namespace, batch.table, len(batch.rows), err)
 	}
+	a.txBytes += estimateParamBytes(vals)
 	return nil
 }
 
@@ -327,6 +382,9 @@ func (a *Applier) flushBatchCopy(ctx context.Context, tx pgx.Tx, batch *insertBa
 	)
 	if err != nil {
 		return fmt.Errorf("copy into %s.%s (%d rows): %w", batch.namespace, batch.table, len(copyRows), err)
+	}
+	for _, row := range copyRows {
+		a.txBytes += estimateParamBytes(row)
 	}
 	return nil
 }

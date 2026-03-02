@@ -10,6 +10,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/jfoltran/pgmanager/internal/backup"
 	"github.com/jfoltran/pgmanager/internal/cluster"
 	"github.com/jfoltran/pgmanager/internal/config"
 	"github.com/jfoltran/pgmanager/internal/daemon"
@@ -28,6 +29,7 @@ type Server struct {
 	clusters   *cluster.Store
 	migStore   *ms.Store
 	migRunner  *ms.Runner
+	backups    *backup.Store
 	srv        *http.Server
 }
 
@@ -54,6 +56,11 @@ func (s *Server) SetClusterStore(cs *cluster.Store) {
 func (s *Server) SetMigrationStore(store *ms.Store, runner *ms.Runner) {
 	s.migStore = store
 	s.migRunner = runner
+}
+
+// SetBackupStore attaches a backup store for backup management.
+func (s *Server) SetBackupStore(bs *backup.Store) {
+	s.backups = bs
 }
 
 // Start begins serving on the given address and port. It blocks until the context is cancelled.
@@ -103,6 +110,18 @@ func (s *Server) Start(ctx context.Context, listen string, port int) error {
 		mux.HandleFunc("POST /api/v1/migrations/{id}/start", mh.start)
 		mux.HandleFunc("POST /api/v1/migrations/{id}/stop", mh.stop)
 		mux.HandleFunc("POST /api/v1/migrations/{id}/switchover", mh.switchover)
+		mux.HandleFunc("GET /api/v1/migrations/{id}/logs", mh.logs)
+	}
+
+	// Backup routes.
+	if s.backups != nil {
+		bh := &backupHandlers{store: s.backups}
+		mux.HandleFunc("GET /api/v1/backups", bh.list)
+		mux.HandleFunc("GET /api/v1/backups/latest", bh.latest)
+		mux.HandleFunc("GET /api/v1/backups/{id}", bh.get)
+		mux.HandleFunc("DELETE /api/v1/backups/{id}", bh.remove)
+		mux.HandleFunc("POST /api/v1/backups/sync", bh.sync)
+		mux.HandleFunc("POST /api/v1/backups/generate-config", bh.generateConfig)
 	}
 
 	// Serve embedded frontend with SPA fallback.

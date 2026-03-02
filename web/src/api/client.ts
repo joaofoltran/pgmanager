@@ -1,6 +1,7 @@
 import type { Snapshot, LogEntry } from "../types/metrics";
 import type { Cluster, ConnTestResult, ClusterInfo } from "../types/cluster";
 import type { Migration, CreateMigrationRequest } from "../types/migration";
+import type { Backup } from "../types/backup";
 
 const BASE = "";
 
@@ -199,6 +200,46 @@ export async function stopMigration(id: string): Promise<void> {
 export async function switchoverMigration(id: string): Promise<void> {
   const res = await fetch(`${BASE}/api/v1/migrations/${encodeURIComponent(id)}/switchover`, {
     method: "POST",
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body || `HTTP ${res.status}`);
+  }
+}
+
+export async function fetchMigrationLogs(id: string): Promise<LogEntry[]> {
+  const res = await fetch(`${BASE}/api/v1/migrations/${encodeURIComponent(id)}/logs`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+// --- Backups ---
+
+export async function fetchBackups(clusterId: string): Promise<Backup[]> {
+  const res = await fetch(
+    `${BASE}/api/v1/backups?cluster_id=${encodeURIComponent(clusterId)}`
+  );
+  return res.json();
+}
+
+export async function fetchBackup(id: string): Promise<Backup> {
+  const res = await fetch(`${BASE}/api/v1/backups/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchLatestBackup(clusterId: string): Promise<Backup | null> {
+  const res = await fetch(
+    `${BASE}/api/v1/backups/latest?cluster_id=${encodeURIComponent(clusterId)}`
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function removeBackup(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/backups/${encodeURIComponent(id)}`, {
+    method: "DELETE",
   });
   if (!res.ok) {
     const body = await res.text();

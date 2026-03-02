@@ -13,11 +13,29 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// SchemaStatementDetail records a skipped or errored DDL statement.
+type SchemaStatementDetail struct {
+	Statement string `json:"statement"`
+	Reason    string `json:"reason"`
+}
+
+// SchemaResult holds the outcome of a DDL application.
+type SchemaResult struct {
+	Total           int
+	Applied         int
+	Skipped         int
+	ErrorsTolerated int
+	SkippedDetails  []SchemaStatementDetail
+	ErroredDetails  []SchemaStatementDetail
+}
+
 // Manager handles DDL operations between source and destination databases.
 type Manager struct {
-	source *pgxpool.Pool
-	dest   *pgxpool.Pool
-	logger zerolog.Logger
+	source            *pgxpool.Pool
+	dest              *pgxpool.Pool
+	logger            zerolog.Logger
+	MaxErrors         int
+	ExcludeExtensions []string
 }
 
 // NewMigrator creates a schema Manager.
@@ -45,9 +63,11 @@ func (m *Manager) DumpSchema(ctx context.Context, dsn string) (string, error) {
 // ApplySchema applies the given DDL to the destination database.
 // It strips psql meta-commands (lines starting with \) and SQL comments
 // from pg_dump output, then executes each statement individually.
-func (m *Manager) ApplySchema(ctx context.Context, ddl string) error {
+// When MaxErrors > 0, up to that many non-duplicate errors are tolerated.
+func (m *Manager) ApplySchema(ctx context.Context, ddl string) (SchemaResult, error) {
 	stmts := splitStatements(ddl)
-	applied := 0
+	var result SchemaResult
+	result.Total = len(stmts)
 	for i, stmt := range stmts {
 		upper := strings.ToUpper(strings.TrimSpace(stmt))
 		if strings.HasPrefix(upper, "SELECT ") {
@@ -60,15 +80,29 @@ func (m *Manager) ApplySchema(ctx context.Context, ddl string) error {
 		if err != nil {
 			if isDuplicateObjectErr(err) {
 				m.logger.Debug().Str("statement", truncate(stmt, 120)).Msg("skipping (already exists)")
+				result.Skipped++
+				result.SkippedDetails = append(result.SkippedDetails, SchemaStatementDetail{
+					Statement: truncate(stmt, 200),
+					Reason:    "already exists",
+				})
+				continue
+			}
+			if m.MaxErrors > 0 && result.ErrorsTolerated < m.MaxErrors {
+				result.ErrorsTolerated++
+				m.logger.Warn().Str("statement", truncate(stmt, 200)).Err(err).Int("error_count", result.ErrorsTolerated).Msg("schema statement failed (tolerated)")
+				result.ErroredDetails = append(result.ErroredDetails, SchemaStatementDetail{
+					Statement: truncate(stmt, 200),
+					Reason:    err.Error(),
+				})
 				continue
 			}
 			m.logger.Warn().Str("statement", truncate(stmt, 200)).Err(err).Msg("schema statement failed")
-			return fmt.Errorf("apply schema: %w", err)
+			return result, fmt.Errorf("apply schema: %w", err)
 		}
-		applied++
+		result.Applied++
 	}
-	m.logger.Info().Int("applied", applied).Int("total", len(stmts)).Msg("schema applied to destination")
-	return nil
+	m.logger.Info().Int("applied", result.Applied).Int("skipped", result.Skipped).Int("errors_tolerated", result.ErrorsTolerated).Int("total", result.Total).Msg("schema applied to destination")
+	return result, nil
 }
 
 // splitStatements parses pg_dump output into individual SQL statements,

@@ -40,10 +40,11 @@ func (ch *clusterHandlers) get(w http.ResponseWriter, r *http.Request) {
 }
 
 type addClusterRequest struct {
-	ID    string         `json:"id"`
-	Name  string         `json:"name"`
-	Nodes []cluster.Node `json:"nodes"`
-	Tags  []string       `json:"tags,omitempty"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Nodes      []cluster.Node `json:"nodes"`
+	Tags       []string       `json:"tags,omitempty"`
+	BackupPath string         `json:"backup_path,omitempty"`
 }
 
 func (ch *clusterHandlers) add(w http.ResponseWriter, r *http.Request) {
@@ -54,10 +55,11 @@ func (ch *clusterHandlers) add(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := cluster.Cluster{
-		ID:    req.ID,
-		Name:  req.Name,
-		Nodes: req.Nodes,
-		Tags:  req.Tags,
+		ID:         req.ID,
+		Name:       req.Name,
+		Nodes:      req.Nodes,
+		Tags:       req.Tags,
+		BackupPath: req.BackupPath,
 	}
 
 	if err := cluster.ValidateCluster(c); err != nil {
@@ -89,10 +91,11 @@ func (ch *clusterHandlers) update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := cluster.Cluster{
-		ID:    id,
-		Name:  req.Name,
-		Nodes: req.Nodes,
-		Tags:  req.Tags,
+		ID:         id,
+		Name:       req.Name,
+		Nodes:      req.Nodes,
+		Tags:       req.Tags,
+		BackupPath: req.BackupPath,
 	}
 
 	if err := cluster.ValidateCluster(c); err != nil {

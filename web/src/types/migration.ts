@@ -1,4 +1,4 @@
-import type { TableProgress } from "./metrics";
+import type { TableProgress, MigrationEvent, PhaseEntry, ErrorEntry, SchemaStats } from "./metrics";
 
 export type MigrationMode = "clone_only" | "clone_and_follow" | "clone_follow_switchover";
 
@@ -42,6 +42,14 @@ export interface Migration {
   live_bytes_per_sec?: number;
   live_total_rows?: number;
   live_total_bytes?: number;
+  live_lag_bytes?: number;
+  live_lag_formatted?: string;
+  live_events?: MigrationEvent[];
+  live_phases?: PhaseEntry[];
+  live_error_history?: ErrorEntry[];
+  live_schema_stats?: SchemaStats;
+  live_error_count?: number;
+  live_elapsed_sec?: number;
 }
 
 export interface CreateMigrationRequest {

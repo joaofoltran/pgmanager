@@ -15,6 +15,7 @@ import (
 	"github.com/jfoltran/pgmanager/internal/migration/bidi"
 	"github.com/jfoltran/pgmanager/internal/config"
 	"github.com/jfoltran/pgmanager/internal/metrics"
+	"github.com/jfoltran/pgmanager/internal/migration/filter"
 	"github.com/jfoltran/pgmanager/internal/migration/replay"
 	"github.com/jfoltran/pgmanager/internal/migration/schema"
 	"github.com/jfoltran/pgmanager/internal/migration/sentinel"
@@ -146,6 +147,11 @@ func (p *Pipeline) initComponents() {
 		case "start":
 			lastReported.Store(key, int64(0))
 			p.Metrics.TableStarted(table.Schema, table.Name)
+		case "retry":
+			p.Metrics.RecordEvent("copy_retry", fmt.Sprintf("retrying COPY for %s (attempt %d)", key, rowsCopied), map[string]string{
+				"table": key,
+				"attempt": fmt.Sprintf("%d", rowsCopied),
+			})
 		case "progress":
 			var delta int64
 			if prev, ok := lastReported.Load(key); ok {
@@ -171,7 +177,25 @@ func (p *Pipeline) initComponents() {
 		}
 	})
 	p.schemaMgr = schema.NewManager(p.srcPool, p.dstPool, p.logger)
+	if p.cfg.Schema.MaxErrors > 0 {
+		p.schemaMgr.MaxErrors = p.cfg.Schema.MaxErrors
+	}
+	if len(p.cfg.Schema.ExcludeExtensions) > 0 {
+		p.schemaMgr.ExcludeExtensions = p.cfg.Schema.ExcludeExtensions
+	}
 	p.coordinator = sentinel.NewCoordinator(p.messages, p.logger)
+
+	filterCfg := filter.Config{
+		IncludeSchemas: p.cfg.Filter.IncludeSchemas,
+		ExcludeSchemas: p.cfg.Filter.ExcludeSchemas,
+		IncludeTables:  p.cfg.Filter.IncludeTables,
+		ExcludeTables:  p.cfg.Filter.ExcludeTables,
+	}
+	if !filterCfg.IsEmpty() {
+		f := filter.New(filterCfg)
+		p.applier.SetFilter(f.Allow)
+		p.copier.SetFilter(f.Allow)
+	}
 
 	if p.cfg.Replication.OriginID != "" {
 		p.bidiFilter = bidi.NewFilter(p.cfg.Replication.OriginID, p.logger)
@@ -212,9 +236,13 @@ func (p *Pipeline) RunClone(ctx context.Context) error {
 		return fmt.Errorf("dump schema: %w", err)
 	}
 	p.logger.Info().Msg("applying schema to destination")
-	if err := p.schemaMgr.ApplySchema(ctx, ddl); err != nil {
+	schemaResult, err := p.schemaMgr.ApplySchema(ctx, ddl)
+	p.Metrics.SetSchemaStats(schemaResult.Total, schemaResult.Applied, schemaResult.Skipped, schemaResult.ErrorsTolerated, convertSchemaDetails(schemaResult.SkippedDetails), convertSchemaDetails(schemaResult.ErroredDetails))
+	if err != nil {
+		p.Metrics.RecordErrorDetail(err, "schema", false)
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	p.Metrics.RecordEvent("schema_applied", fmt.Sprintf("applied %d/%d statements (%d skipped, %d errors tolerated)", schemaResult.Applied, schemaResult.Total, schemaResult.Skipped, schemaResult.ErrorsTolerated), nil)
 
 	// Create replication slot to get consistent snapshot.
 	// The snapshot stays valid until StartStreaming is called.
@@ -241,8 +269,13 @@ func (p *Pipeline) RunClone(ctx context.Context) error {
 
 	results := p.copier.CopyAll(ctx, tables, snapshotName)
 	for _, r := range results {
+		if r.Retries > 0 {
+			p.Metrics.RecordEvent("copy_completed_with_retries", fmt.Sprintf("%s completed after %d retries", r.Table.QualifiedName(), r.Retries), map[string]string{
+				"table": r.Table.QualifiedName(), "retries": fmt.Sprintf("%d", r.Retries),
+			})
+		}
 		if r.Err != nil {
-			p.Metrics.RecordError(r.Err)
+			p.Metrics.RecordErrorDetail(r.Err, "copy", false)
 			return fmt.Errorf("copy %s: %w", r.Table.QualifiedName(), r.Err)
 		}
 		p.Metrics.RecordApplied(0, 0, r.Table.SizeBytes)
@@ -286,9 +319,13 @@ func (p *Pipeline) RunCloneAndFollow(ctx context.Context) error {
 		return fmt.Errorf("dump schema: %w", err)
 	}
 	p.logger.Info().Msg("applying schema to destination")
-	if err := p.schemaMgr.ApplySchema(ctx, ddl); err != nil {
+	schemaResult, err := p.schemaMgr.ApplySchema(ctx, ddl)
+	p.Metrics.SetSchemaStats(schemaResult.Total, schemaResult.Applied, schemaResult.Skipped, schemaResult.ErrorsTolerated, convertSchemaDetails(schemaResult.SkippedDetails), convertSchemaDetails(schemaResult.ErroredDetails))
+	if err != nil {
+		p.Metrics.RecordErrorDetail(err, "schema", false)
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	p.Metrics.RecordEvent("schema_applied", fmt.Sprintf("applied %d/%d statements (%d skipped, %d errors tolerated)", schemaResult.Applied, schemaResult.Total, schemaResult.Skipped, schemaResult.ErrorsTolerated), nil)
 
 	// Create replication slot to get consistent snapshot.
 	p.logger.Info().Str("slot", p.cfg.Replication.SlotName).Msg("creating replication slot")
@@ -314,8 +351,13 @@ func (p *Pipeline) RunCloneAndFollow(ctx context.Context) error {
 
 	results := p.copier.CopyAll(ctx, tables, snapshotName)
 	for _, r := range results {
+		if r.Retries > 0 {
+			p.Metrics.RecordEvent("copy_completed_with_retries", fmt.Sprintf("%s completed after %d retries", r.Table.QualifiedName(), r.Retries), map[string]string{
+				"table": r.Table.QualifiedName(), "retries": fmt.Sprintf("%d", r.Retries),
+			})
+		}
 		if r.Err != nil {
-			p.Metrics.RecordError(r.Err)
+			p.Metrics.RecordErrorDetail(r.Err, "copy", false)
 			return fmt.Errorf("copy %s: %w", r.Table.QualifiedName(), r.Err)
 		}
 		p.Metrics.RecordApplied(0, 0, r.Table.SizeBytes)
@@ -412,9 +454,13 @@ func (p *Pipeline) RunResumeCloneAndFollow(ctx context.Context) error {
 		return fmt.Errorf("dump schema: %w", err)
 	}
 	p.logger.Info().Msg("applying schema to destination")
-	if err := p.schemaMgr.ApplySchema(ctx, ddl); err != nil {
+	schemaResult, err := p.schemaMgr.ApplySchema(ctx, ddl)
+	p.Metrics.SetSchemaStats(schemaResult.Total, schemaResult.Applied, schemaResult.Skipped, schemaResult.ErrorsTolerated, convertSchemaDetails(schemaResult.SkippedDetails), convertSchemaDetails(schemaResult.ErroredDetails))
+	if err != nil {
+		p.Metrics.RecordErrorDetail(err, "schema", false)
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	p.Metrics.RecordEvent("schema_applied", fmt.Sprintf("applied %d/%d statements (%d skipped, %d errors tolerated)", schemaResult.Applied, schemaResult.Total, schemaResult.Skipped, schemaResult.ErrorsTolerated), nil)
 
 	// Check that the replication slot survived.
 	p.setPhase("resuming")
@@ -488,8 +534,13 @@ func (p *Pipeline) RunResumeCloneAndFollow(ctx context.Context) error {
 
 		results := p.copier.CopyAll(ctx, incompleteTables, "")
 		for _, r := range results {
+			if r.Retries > 0 {
+				p.Metrics.RecordEvent("copy_completed_with_retries", fmt.Sprintf("%s completed after %d retries", r.Table.QualifiedName(), r.Retries), map[string]string{
+					"table": r.Table.QualifiedName(), "retries": fmt.Sprintf("%d", r.Retries),
+				})
+			}
 			if r.Err != nil {
-				p.Metrics.RecordError(r.Err)
+				p.Metrics.RecordErrorDetail(r.Err, "copy", false)
 				return fmt.Errorf("copy %s: %w", r.Table.QualifiedName(), r.Err)
 			}
 			p.Metrics.RecordApplied(0, 0, r.Table.SizeBytes)
@@ -894,4 +945,15 @@ func (p *Pipeline) ensurePublication(ctx context.Context) error {
 	}
 	p.logger.Info().Str("publication", pubName).Msg("created publication")
 	return nil
+}
+
+func convertSchemaDetails(in []schema.SchemaStatementDetail) []metrics.SchemaStatementDetail {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]metrics.SchemaStatementDetail, len(in))
+	for i, d := range in {
+		out[i] = metrics.SchemaStatementDetail{Statement: d.Statement, Reason: d.Reason}
+	}
+	return out
 }

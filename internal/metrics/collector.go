@@ -61,6 +61,52 @@ type Snapshot struct {
 	// Errors
 	ErrorCount   int             `json:"error_count"`
 	LastError    string          `json:"last_error,omitempty"`
+
+	// Observability
+	Events       []MigrationEvent `json:"events,omitempty"`
+	Phases       []PhaseEntry     `json:"phases,omitempty"`
+	ErrorHistory []ErrorEntry     `json:"error_history,omitempty"`
+	SchemaStats  *SchemaStats     `json:"schema_stats,omitempty"`
+}
+
+// MigrationEvent records a notable event during migration.
+type MigrationEvent struct {
+	Time    time.Time         `json:"time"`
+	Type    string            `json:"type"`
+	Message string            `json:"message"`
+	Fields  map[string]string `json:"fields,omitempty"`
+}
+
+// PhaseEntry records how long a phase lasted.
+type PhaseEntry struct {
+	Phase     string    `json:"phase"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+	Duration  float64   `json:"duration_sec"`
+}
+
+// ErrorEntry records an error with context.
+type ErrorEntry struct {
+	Time      time.Time `json:"time"`
+	Phase     string    `json:"phase"`
+	Message   string    `json:"message"`
+	Retryable bool      `json:"retryable"`
+}
+
+// SchemaStatementDetail records a skipped or errored DDL statement.
+type SchemaStatementDetail struct {
+	Statement string `json:"statement"`
+	Reason    string `json:"reason"`
+}
+
+// SchemaStats tracks DDL application results.
+type SchemaStats struct {
+	StatementsTotal    int                     `json:"statements_total"`
+	StatementsApplied  int                     `json:"statements_applied"`
+	StatementsSkipped  int                     `json:"statements_skipped"`
+	ErrorsTolerated    int                     `json:"errors_tolerated"`
+	SkippedDetails     []SchemaStatementDetail `json:"skipped_details,omitempty"`
+	ErroredDetails     []SchemaStatementDetail `json:"errored_details,omitempty"`
 }
 
 // LogEntry represents a log line captured for the UI.
@@ -105,6 +151,14 @@ type Collector struct {
 	logs    []LogEntry
 	logCap  int
 
+	// Event tracking for observability.
+	eventMu      sync.Mutex
+	events       []MigrationEvent
+	phases       []PhaseEntry
+	errorHistory []ErrorEntry
+	schemaStats  *SchemaStats
+	eventCap     int
+
 	done chan struct{}
 }
 
@@ -118,6 +172,8 @@ func NewCollector(logger zerolog.Logger) *Collector {
 		byteWindow:  newSlidingWindow(60 * time.Second),
 		logs:        make([]LogEntry, 0, 500),
 		logCap:      500,
+		events:      make([]MigrationEvent, 0, 200),
+		eventCap:    200,
 		done:        make(chan struct{}),
 	}
 	go c.broadcastLoop()
@@ -127,11 +183,29 @@ func NewCollector(logger zerolog.Logger) *Collector {
 // SetPhase updates the current pipeline phase.
 func (c *Collector) SetPhase(phase string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.phase = phase
+	now := time.Now()
 	if c.startedAt.IsZero() {
-		c.startedAt = time.Now()
+		c.startedAt = now
 	}
+	oldPhase := c.phase
+	c.phase = phase
+	c.mu.Unlock()
+
+	c.eventMu.Lock()
+	if oldPhase != "" && len(c.phases) > 0 {
+		last := &c.phases[len(c.phases)-1]
+		if last.Phase == oldPhase && last.EndedAt.IsZero() {
+			last.EndedAt = now
+			last.Duration = now.Sub(last.StartedAt).Seconds()
+		}
+	}
+	c.phases = append(c.phases, PhaseEntry{
+		Phase:     phase,
+		StartedAt: now,
+	})
+	c.eventMu.Unlock()
+
+	c.RecordEvent("phase_change", "entered phase: "+phase, nil)
 }
 
 // SetTables initializes the table tracking list.
@@ -241,6 +315,56 @@ func (c *Collector) RecordError(err error) {
 	}
 }
 
+// RecordEvent adds a notable event to the event log.
+func (c *Collector) RecordEvent(eventType, message string, fields map[string]string) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if len(c.events) >= c.eventCap {
+		n := c.eventCap / 4
+		copy(c.events, c.events[n:])
+		c.events = c.events[:len(c.events)-n]
+	}
+	c.events = append(c.events, MigrationEvent{
+		Time:    time.Now(),
+		Type:    eventType,
+		Message: message,
+		Fields:  fields,
+	})
+}
+
+// RecordErrorDetail records an error with phase context and retryability.
+func (c *Collector) RecordErrorDetail(err error, phase string, retryable bool) {
+	c.RecordError(err)
+	if err == nil {
+		return
+	}
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.errorHistory = append(c.errorHistory, ErrorEntry{
+		Time:      time.Now(),
+		Phase:     phase,
+		Message:   err.Error(),
+		Retryable: retryable,
+	})
+	if len(c.errorHistory) > c.eventCap {
+		c.errorHistory = c.errorHistory[len(c.errorHistory)-c.eventCap:]
+	}
+}
+
+// SetSchemaStats records the results of DDL application.
+func (c *Collector) SetSchemaStats(total, applied, skipped, errTolerated int, skippedDetails, erroredDetails []SchemaStatementDetail) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.schemaStats = &SchemaStats{
+		StatementsTotal:   total,
+		StatementsApplied: applied,
+		StatementsSkipped: skipped,
+		ErrorsTolerated:   errTolerated,
+		SkippedDetails:    skippedDetails,
+		ErroredDetails:    erroredDetails,
+	}
+}
+
 // AddLog appends a log entry to the ring buffer.
 func (c *Collector) AddLog(entry LogEntry) {
 	c.logMu.Lock()
@@ -308,7 +432,59 @@ func (c *Collector) Snapshot() Snapshot {
 		TotalBytes:   c.totalBytes.Load(),
 		ErrorCount:   int(c.errorCount.Load()),
 		LastError:    lastErr,
+		Events:       c.snapshotEvents(),
+		Phases:       c.snapshotPhases(),
+		ErrorHistory: c.snapshotErrorHistory(),
+		SchemaStats:  c.snapshotSchemaStats(),
 	}
+}
+
+func (c *Collector) snapshotEvents() []MigrationEvent {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if len(c.events) == 0 {
+		return nil
+	}
+	out := make([]MigrationEvent, len(c.events))
+	copy(out, c.events)
+	return out
+}
+
+func (c *Collector) snapshotPhases() []PhaseEntry {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if len(c.phases) == 0 {
+		return nil
+	}
+	now := time.Now()
+	out := make([]PhaseEntry, len(c.phases))
+	copy(out, c.phases)
+	last := &out[len(out)-1]
+	if last.EndedAt.IsZero() {
+		last.Duration = now.Sub(last.StartedAt).Seconds()
+	}
+	return out
+}
+
+func (c *Collector) snapshotErrorHistory() []ErrorEntry {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if len(c.errorHistory) == 0 {
+		return nil
+	}
+	out := make([]ErrorEntry, len(c.errorHistory))
+	copy(out, c.errorHistory)
+	return out
+}
+
+func (c *Collector) snapshotSchemaStats() *SchemaStats {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if c.schemaStats == nil {
+		return nil
+	}
+	s := *c.schemaStats
+	return &s
 }
 
 // Subscribe returns a channel that receives periodic Snapshot updates.

@@ -14,11 +14,22 @@ type LogWriter struct {
 }
 
 // NewLogWriter creates a LogWriter that feeds into the given Collector.
+// The collector may be nil and set later via SetCollector.
 func NewLogWriter(c *Collector) *LogWriter {
 	return &LogWriter{collector: c}
 }
 
+// SetCollector changes the target Collector. Use this when the Collector
+// is not available at construction time (e.g. it lives inside a Pipeline
+// that is created after the logger).
+func (w *LogWriter) SetCollector(c *Collector) {
+	w.collector = c
+}
+
 func (w *LogWriter) Write(p []byte) (int, error) {
+	if w.collector == nil {
+		return len(p), nil
+	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal(p, &raw); err != nil {
 		w.collector.AddLog(LogEntry{

@@ -113,8 +113,11 @@ func (r *Runner) Start(ctx context.Context, migrationID string) error {
 		return fmt.Errorf("migration %q is already running", migrationID)
 	}
 
-	pipelineLogger := r.logger.With().Str("migration", migrationID).Logger()
+	logWriter := metrics.NewLogWriter(nil)
+	pipelineLogger := zerolog.New(zerolog.MultiLevelWriter(r.logger, logWriter)).
+		With().Timestamp().Str("migration", migrationID).Logger()
 	p := pipeline.New(cfg, pipelineLogger)
+	logWriter.SetCollector(p.Metrics)
 
 	jobCtx, cancel := context.WithCancel(r.ctx)
 	r.running[migrationID] = &runningJob{pipeline: p, cancel: cancel, done: make(chan struct{})}
@@ -270,8 +273,11 @@ func (r *Runner) startReverse(id string, m Migration, startLSN pglogrepl.LSN) {
 	cfg.Replication.OutputPlugin = "pgoutput"
 	cfg.Snapshot.Workers = m.CopyWorkers
 
-	pipelineLogger := r.logger.With().Str("migration", id).Logger()
+	logWriter := metrics.NewLogWriter(nil)
+	pipelineLogger := zerolog.New(zerolog.MultiLevelWriter(r.logger, logWriter)).
+		With().Timestamp().Str("migration", id).Logger()
 	p := pipeline.New(cfg, pipelineLogger)
+	logWriter.SetCollector(p.Metrics)
 
 	jobCtx, cancel := context.WithCancel(r.ctx)
 
@@ -335,6 +341,17 @@ func (r *Runner) MetricsSnapshot(migrationID string) *metrics.Snapshot {
 	}
 	snap := job.pipeline.Metrics.Snapshot()
 	return &snap
+}
+
+// Logs returns the log entries from a running migration's collector.
+func (r *Runner) Logs(migrationID string) []metrics.LogEntry {
+	r.mu.Lock()
+	job, ok := r.running[migrationID]
+	r.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return job.pipeline.Metrics.Logs()
 }
 
 func (r *Runner) run(ctx context.Context, id string, mode Mode, p *pipeline.Pipeline) {

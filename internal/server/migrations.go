@@ -44,26 +44,42 @@ func (mh *migrationHandlers) get(w http.ResponseWriter, r *http.Request) {
 		if snap := mh.runner.MetricsSnapshot(id); snap != nil {
 			resp := struct {
 				ms.Migration
-				LivePhase      string                 `json:"live_phase,omitempty"`
-				LiveLSN        string                 `json:"live_lsn,omitempty"`
-				LiveTables     int                    `json:"live_tables_total,omitempty"`
-				LiveCopied     int                    `json:"live_tables_copied,omitempty"`
-				LiveTablesList []metrics.TableProgress `json:"live_tables,omitempty"`
-				LiveRowsPerSec float64                `json:"live_rows_per_sec,omitempty"`
-				LiveBytesPerSec float64               `json:"live_bytes_per_sec,omitempty"`
-				LiveTotalRows  int64                  `json:"live_total_rows,omitempty"`
-				LiveTotalBytes int64                  `json:"live_total_bytes,omitempty"`
+				LivePhase        string                 `json:"live_phase,omitempty"`
+				LiveLSN          string                 `json:"live_lsn,omitempty"`
+				LiveTables       int                    `json:"live_tables_total,omitempty"`
+				LiveCopied       int                    `json:"live_tables_copied,omitempty"`
+				LiveTablesList   []metrics.TableProgress `json:"live_tables,omitempty"`
+				LiveRowsPerSec   float64                `json:"live_rows_per_sec,omitempty"`
+				LiveBytesPerSec  float64                `json:"live_bytes_per_sec,omitempty"`
+				LiveTotalRows    int64                  `json:"live_total_rows,omitempty"`
+				LiveTotalBytes   int64                  `json:"live_total_bytes,omitempty"`
+				LiveLagBytes     uint64                 `json:"live_lag_bytes,omitempty"`
+				LiveLagFormatted string                 `json:"live_lag_formatted,omitempty"`
+				LiveEvents       []metrics.MigrationEvent `json:"live_events,omitempty"`
+				LivePhases       []metrics.PhaseEntry   `json:"live_phases,omitempty"`
+				LiveErrorHistory []metrics.ErrorEntry   `json:"live_error_history,omitempty"`
+				LiveSchemaStats  *metrics.SchemaStats   `json:"live_schema_stats,omitempty"`
+				LiveErrorCount   int                    `json:"live_error_count,omitempty"`
+				LiveElapsedSec   float64                `json:"live_elapsed_sec,omitempty"`
 			}{
-				Migration:       m,
-				LivePhase:       snap.Phase,
-				LiveLSN:         snap.AppliedLSN,
-				LiveTables:      snap.TablesTotal,
-				LiveCopied:      snap.TablesCopied,
-				LiveTablesList:  snap.Tables,
-				LiveRowsPerSec:  snap.RowsPerSec,
-				LiveBytesPerSec: snap.BytesPerSec,
-				LiveTotalRows:   snap.TotalRows,
-				LiveTotalBytes:  snap.TotalBytes,
+				Migration:        m,
+				LivePhase:        snap.Phase,
+				LiveLSN:          snap.AppliedLSN,
+				LiveTables:       snap.TablesTotal,
+				LiveCopied:       snap.TablesCopied,
+				LiveTablesList:   snap.Tables,
+				LiveRowsPerSec:   snap.RowsPerSec,
+				LiveBytesPerSec:  snap.BytesPerSec,
+				LiveTotalRows:    snap.TotalRows,
+				LiveTotalBytes:   snap.TotalBytes,
+				LiveLagBytes:     snap.LagBytes,
+				LiveLagFormatted: snap.LagFormatted,
+				LiveEvents:       snap.Events,
+				LivePhases:       snap.Phases,
+				LiveErrorHistory: snap.ErrorHistory,
+				LiveSchemaStats:  snap.SchemaStats,
+				LiveErrorCount:   snap.ErrorCount,
+				LiveElapsedSec:   snap.ElapsedSec,
 			}
 			writeJSON(w, resp)
 			return
@@ -200,4 +216,18 @@ func (mh *migrationHandlers) switchover(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, map[string]any{"ok": true, "message": "switchover started"})
+}
+
+func (mh *migrationHandlers) logs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if mh.runner == nil {
+		http.Error(w, "migration runner not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	logs := mh.runner.Logs(id)
+	if logs == nil {
+		logs = []metrics.LogEntry{}
+	}
+	writeJSON(w, logs)
 }

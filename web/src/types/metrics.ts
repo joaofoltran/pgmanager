@@ -31,6 +31,11 @@ export interface Snapshot {
 
   error_count: number;
   last_error?: string;
+
+  events?: MigrationEvent[];
+  phases?: PhaseEntry[];
+  error_history?: ErrorEntry[];
+  schema_stats?: SchemaStats;
 }
 
 export interface LogEntry {
@@ -38,4 +43,39 @@ export interface LogEntry {
   level: string;
   message: string;
   fields?: Record<string, string>;
+}
+
+export interface MigrationEvent {
+  time: string;
+  type: string;
+  message: string;
+  fields?: Record<string, string>;
+}
+
+export interface PhaseEntry {
+  phase: string;
+  started_at: string;
+  ended_at?: string;
+  duration_sec: number;
+}
+
+export interface ErrorEntry {
+  time: string;
+  phase: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface SchemaStatementDetail {
+  statement: string;
+  reason: string;
+}
+
+export interface SchemaStats {
+  statements_total: number;
+  statements_applied: number;
+  statements_skipped: number;
+  errors_tolerated: number;
+  skipped_details?: SchemaStatementDetail[];
+  errored_details?: SchemaStatementDetail[];
 }

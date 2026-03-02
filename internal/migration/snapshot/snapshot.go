@@ -2,12 +2,14 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
@@ -28,10 +30,17 @@ func (t TableInfo) QualifiedName() string {
 	return t.Schema + "." + t.Name
 }
 
+const (
+	copyRetryBudget = 30 * time.Minute
+	copyRetryBase   = 2 * time.Second
+	copyRetryCap    = 5 * time.Minute
+)
+
 // CopyResult holds the outcome of copying a single table.
 type CopyResult struct {
 	Table      TableInfo
 	RowsCopied int64
+	Retries    int
 	Err        error
 }
 
@@ -45,6 +54,7 @@ type Copier struct {
 	dest     *pgxpool.Pool
 	logger   zerolog.Logger
 	progress ProgressFunc
+	filterFn func(namespace, table string) bool
 
 	workers int
 }
@@ -62,6 +72,12 @@ func NewCopier(source, dest *pgxpool.Pool, workers int, logger zerolog.Logger) *
 // SetProgressFunc sets a callback for COPY progress reporting.
 func (c *Copier) SetProgressFunc(fn ProgressFunc) {
 	c.progress = fn
+}
+
+// SetFilter sets a function that returns true if the given table should be copied.
+// Tables where filterFn returns false are excluded from ListTables results.
+func (c *Copier) SetFilter(fn func(namespace, table string) bool) {
+	c.filterFn = fn
 }
 
 // ListTables returns all user tables from the source database.
@@ -84,6 +100,10 @@ func (c *Copier) ListTables(ctx context.Context) ([]TableInfo, error) {
 		var t TableInfo
 		if err := rows.Scan(&t.Schema, &t.Name, &t.RowCount, &t.SizeBytes); err != nil {
 			return nil, fmt.Errorf("scan table info: %w", err)
+		}
+		if c.filterFn != nil && !c.filterFn(t.Schema, t.Name) {
+			c.logger.Debug().Str("table", t.QualifiedName()).Msg("filtered out by table filter")
+			continue
 		}
 		tables = append(tables, t)
 	}
@@ -166,6 +186,43 @@ func (c *Copier) copyTable(ctx context.Context, table TableInfo, snapshotName st
 	log.Info().Msg("starting COPY")
 	c.reportProgress(table, "start", 0)
 
+	deadline := time.Now().Add(copyRetryBudget)
+	delay := copyRetryBase
+	retries := 0
+
+	for {
+		result := c.copyTableOnce(ctx, table, snapshotName, workerID)
+		if result.Err == nil {
+			result.Retries = retries
+			log.Info().Int64("rows", result.RowsCopied).Int("retries", retries).Msg("COPY complete")
+			c.reportProgress(table, "done", result.RowsCopied)
+			return result
+		}
+
+		if !isConnectionError(result.Err) || time.Now().After(deadline) || ctx.Err() != nil {
+			result.Retries = retries
+			return result
+		}
+
+		retries++
+		log.Warn().
+			Err(result.Err).
+			Int("retry", retries).
+			Dur("delay", delay).
+			Msg("COPY failed (connection error), retrying")
+		c.reportProgress(table, "retry", int64(retries))
+
+		select {
+		case <-ctx.Done():
+			return CopyResult{Table: table, Retries: retries, Err: ctx.Err()}
+		case <-time.After(delay):
+		}
+
+		delay = min(delay*2, copyRetryCap)
+	}
+}
+
+func (c *Copier) copyTableOnce(ctx context.Context, table TableInfo, snapshotName string, workerID int) CopyResult {
 	srcConn, err := c.source.Acquire(ctx)
 	if err != nil {
 		return CopyResult{Table: table, Err: fmt.Errorf("acquire source conn: %w", err)}
@@ -215,9 +272,23 @@ func (c *Copier) copyTable(ctx context.Context, table TableInfo, snapshotName st
 		return CopyResult{Table: table, Err: fmt.Errorf("read from %s: %w", qn, src.err)}
 	}
 
-	log.Info().Int64("rows", n).Msg("COPY complete")
-	c.reportProgress(table, "done", n)
 	return CopyResult{Table: table, RowsCopied: n}
+}
+
+func isConnectionError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return strings.HasPrefix(pgErr.Code, "08")
+	}
+	var connErr *pgconn.ConnectError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "EOF")
 }
 
 // rowStreamer implements pgx.CopyFromSource by streaming rows one at a time

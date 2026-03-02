@@ -50,12 +50,13 @@ func (n Node) DSN() string {
 }
 
 type Cluster struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Nodes     []Node    `json:"nodes"`
-	Tags      []string  `json:"tags,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Nodes      []Node    `json:"nodes"`
+	Tags       []string  `json:"tags,omitempty"`
+	BackupPath string    `json:"backup_path,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type Store struct {
@@ -68,7 +69,7 @@ func NewStore(pool *pgxpool.Pool) *Store {
 
 func (s *Store) List(ctx context.Context) ([]Cluster, error) {
 	rows, err := s.pool.Query(ctx,
-		"SELECT id, name, tags, created_at, updated_at FROM clusters ORDER BY created_at")
+		"SELECT id, name, tags, backup_path, created_at, updated_at FROM clusters ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +78,7 @@ func (s *Store) List(ctx context.Context) ([]Cluster, error) {
 	var clusters []Cluster
 	for rows.Next() {
 		var c Cluster
-		if err := rows.Scan(&c.ID, &c.Name, &c.Tags, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Tags, &c.BackupPath, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		clusters = append(clusters, c)
@@ -99,8 +100,8 @@ func (s *Store) List(ctx context.Context) ([]Cluster, error) {
 func (s *Store) Get(ctx context.Context, id string) (Cluster, bool, error) {
 	var c Cluster
 	err := s.pool.QueryRow(ctx,
-		"SELECT id, name, tags, created_at, updated_at FROM clusters WHERE id = $1", id,
-	).Scan(&c.ID, &c.Name, &c.Tags, &c.CreatedAt, &c.UpdatedAt)
+		"SELECT id, name, tags, backup_path, created_at, updated_at FROM clusters WHERE id = $1", id,
+	).Scan(&c.ID, &c.Name, &c.Tags, &c.BackupPath, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Cluster{}, false, nil
@@ -129,9 +130,9 @@ func (s *Store) Add(ctx context.Context, c Cluster) error {
 		tags = []string{}
 	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO clusters (id, name, tags, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		c.ID, c.Name, tags, now, now)
+		`INSERT INTO clusters (id, name, tags, backup_path, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		c.ID, c.Name, tags, c.BackupPath, now, now)
 	if err != nil {
 		return fmt.Errorf("insert cluster: %w", err)
 	}
@@ -157,8 +158,8 @@ func (s *Store) Update(ctx context.Context, c Cluster) error {
 		tags = []string{}
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE clusters SET name = $2, tags = $3, updated_at = now() WHERE id = $1`,
-		c.ID, c.Name, tags)
+		`UPDATE clusters SET name = $2, tags = $3, backup_path = $4, updated_at = now() WHERE id = $1`,
+		c.ID, c.Name, tags, c.BackupPath)
 	if err != nil {
 		return err
 	}
