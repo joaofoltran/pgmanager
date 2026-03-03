@@ -2,6 +2,11 @@ import type { Snapshot, LogEntry } from "../types/metrics";
 import type { Cluster, ConnTestResult, ClusterInfo } from "../types/cluster";
 import type { Migration, CreateMigrationRequest } from "../types/migration";
 import type { Backup } from "../types/backup";
+import type {
+  MonitoringOverview,
+  Tier2Snapshot,
+  Tier3Snapshot,
+} from "../types/monitoring";
 
 const BASE = "";
 
@@ -245,4 +250,81 @@ export async function removeBackup(id: string): Promise<void> {
     const body = await res.text();
     throw new Error(body || `HTTP ${res.status}`);
   }
+}
+
+// --- Monitoring ---
+
+export async function fetchMonitoringOverview(
+  clusterId: string
+): Promise<MonitoringOverview> {
+  const res = await fetch(
+    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}`
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchNodeTableStats(
+  clusterId: string,
+  nodeId: string
+): Promise<Tier2Snapshot> {
+  const res = await fetch(
+    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(nodeId)}/tables`
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchNodeSizes(
+  clusterId: string,
+  nodeId: string
+): Promise<Tier3Snapshot> {
+  const res = await fetch(
+    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(nodeId)}/sizes`
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function refreshNodeSizes(
+  clusterId: string,
+  nodeId: string
+): Promise<void> {
+  const res = await fetch(
+    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(nodeId)}/refresh-sizes`,
+    { method: "POST" }
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+export async function startMonitoring(clusterId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/monitoring/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cluster_id: clusterId }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body || `HTTP ${res.status}`);
+  }
+}
+
+export async function stopMonitoring(clusterId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/monitoring/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cluster_id: clusterId }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body || `HTTP ${res.status}`);
+  }
+}
+
+export async function fetchMonitoringStatus(): Promise<{
+  monitored_clusters: string[];
+}> {
+  const res = await fetch(`${BASE}/api/v1/monitoring/status`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
