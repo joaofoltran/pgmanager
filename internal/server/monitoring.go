@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -94,7 +95,7 @@ func (mh *monitoringHandlers) startMonitoring(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := mh.collector.StartCluster(r.Context(), cl); err != nil {
+	if err := mh.collector.StartCluster(context.Background(), cl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

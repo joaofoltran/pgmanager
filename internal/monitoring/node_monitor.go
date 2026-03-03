@@ -119,9 +119,9 @@ func (nm *nodeMonitor) connect(ctx context.Context) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 
-	// Detect PG version.
+	// Detect PG version (SHOW returns text, so query the function instead).
 	var versionNum int
-	if err := conn.QueryRow(ctx, "SHOW server_version_num").Scan(&versionNum); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&versionNum); err != nil {
 		conn.Close(ctx)
 		return fmt.Errorf("detect version: %w", err)
 	}
