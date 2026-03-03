@@ -23,6 +23,12 @@ const modules = [
     description: "Backup & restore",
   },
   {
+    name: "Monitoring",
+    path: "/monitoring",
+    icon: Activity,
+    description: "Real-time metrics",
+  },
+  {
     name: "Standby",
     path: "/standby",
     icon: Server,
