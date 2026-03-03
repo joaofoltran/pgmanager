@@ -12,7 +12,6 @@ web/node_modules/
 web/bun.lock
 web/bun.lockb
 web/package-lock.json
-web/src/vite-env.d.ts
 web/tsconfig.tsbuildinfo
 
 # Editor / AI tool directories
