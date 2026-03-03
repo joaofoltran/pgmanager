@@ -45,7 +45,6 @@ Configuration is loaded from (in order):
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "", "Path to config file")
-	rootCmd.AddCommand(migrateCmd)
 }
 
 func main() {
