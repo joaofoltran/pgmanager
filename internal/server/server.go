@@ -16,6 +16,7 @@ import (
 	"github.com/jfoltran/pgmanager/internal/daemon"
 	"github.com/jfoltran/pgmanager/internal/metrics"
 	ms "github.com/jfoltran/pgmanager/internal/migrationstore"
+	"github.com/jfoltran/pgmanager/internal/monitoring"
 )
 
 // Server is the HTTP server that serves the REST API, WebSocket endpoint,
@@ -30,6 +31,7 @@ type Server struct {
 	migStore   *ms.Store
 	migRunner  *ms.Runner
 	backups    *backup.Store
+	monitoring *monitoring.Collector
 	srv        *http.Server
 }
 
@@ -61,6 +63,11 @@ func (s *Server) SetMigrationStore(store *ms.Store, runner *ms.Runner) {
 // SetBackupStore attaches a backup store for backup management.
 func (s *Server) SetBackupStore(bs *backup.Store) {
 	s.backups = bs
+}
+
+// SetMonitoringCollector attaches a monitoring collector.
+func (s *Server) SetMonitoringCollector(mc *monitoring.Collector) {
+	s.monitoring = mc
 }
 
 // Start begins serving on the given address and port. It blocks until the context is cancelled.
@@ -122,6 +129,18 @@ func (s *Server) Start(ctx context.Context, listen string, port int) error {
 		mux.HandleFunc("DELETE /api/v1/backups/{id}", bh.remove)
 		mux.HandleFunc("POST /api/v1/backups/sync", bh.sync)
 		mux.HandleFunc("POST /api/v1/backups/generate-config", bh.generateConfig)
+	}
+
+	// Monitoring routes.
+	if s.monitoring != nil && s.clusters != nil {
+		moh := &monitoringHandlers{collector: s.monitoring, clusters: s.clusters}
+		mux.HandleFunc("GET /api/v1/monitoring/status", moh.status)
+		mux.HandleFunc("POST /api/v1/monitoring/start", moh.startMonitoring)
+		mux.HandleFunc("POST /api/v1/monitoring/stop", moh.stopMonitoring)
+		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}", moh.overview)
+		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/tables", moh.nodeTableStats)
+		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/sizes", moh.nodeSizes)
+		mux.HandleFunc("POST /api/v1/monitoring/{clusterId}/nodes/{nodeId}/refresh-sizes", moh.refreshSizes)
 	}
 
 	// Serve embedded frontend with SPA fallback.
