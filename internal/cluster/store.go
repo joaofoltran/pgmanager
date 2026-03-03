@@ -27,7 +27,8 @@ type Node struct {
 	User     string   `json:"user,omitempty"`
 	Password string   `json:"password,omitempty"`
 	DBName   string   `json:"dbname,omitempty"`
-	AgentURL string   `json:"agent_url,omitempty"`
+	AgentURL          string `json:"agent_url,omitempty"`
+	MonitoringEnabled bool   `json:"monitoring_enabled"`
 }
 
 func (n Node) DSN() string {
@@ -237,7 +238,7 @@ func (s *Store) RemoveNode(ctx context.Context, clusterID, nodeID string) error 
 
 func (s *Store) listNodes(ctx context.Context, clusterID string) ([]Node, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, name, host, port, role, username, password, dbname, agent_url
+		`SELECT id, name, host, port, role, username, password, dbname, agent_url, monitoring_enabled
 		 FROM nodes WHERE cluster_id = $1 ORDER BY id`, clusterID)
 	if err != nil {
 		return nil, err
@@ -248,7 +249,7 @@ func (s *Store) listNodes(ctx context.Context, clusterID string) ([]Node, error)
 	for rows.Next() {
 		var n Node
 		var user, pass, dbname, agentURL string
-		if err := rows.Scan(&n.ID, &n.Name, &n.Host, &n.Port, &n.Role, &user, &pass, &dbname, &agentURL); err != nil {
+		if err := rows.Scan(&n.ID, &n.Name, &n.Host, &n.Port, &n.Role, &user, &pass, &dbname, &agentURL, &n.MonitoringEnabled); err != nil {
 			return nil, err
 		}
 		n.User = user
@@ -265,14 +266,58 @@ func (s *Store) listNodes(ctx context.Context, clusterID string) ([]Node, error)
 
 func insertNode(ctx context.Context, tx pgx.Tx, clusterID string, n Node) error {
 	_, err := tx.Exec(ctx,
-		`INSERT INTO nodes (id, cluster_id, name, host, port, role, username, password, dbname, agent_url)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		`INSERT INTO nodes (id, cluster_id, name, host, port, role, username, password, dbname, agent_url, monitoring_enabled)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		n.ID, clusterID, n.Name, n.Host, n.Port, string(n.Role),
-		n.User, n.Password, n.DBName, n.AgentURL)
+		n.User, n.Password, n.DBName, n.AgentURL, n.MonitoringEnabled)
 	if err != nil {
 		return fmt.Errorf("insert node %q: %w", n.ID, err)
 	}
 	return nil
+}
+
+func (s *Store) SetNodeMonitoring(ctx context.Context, clusterID, nodeID string, enabled bool) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE nodes SET monitoring_enabled = $3 WHERE cluster_id = $1 AND id = $2`,
+		clusterID, nodeID, enabled)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("node %q not found in cluster %q", nodeID, clusterID)
+	}
+	_, err = s.pool.Exec(ctx, "UPDATE clusters SET updated_at = now() WHERE id = $1", clusterID)
+	return err
+}
+
+func (s *Store) ListMonitoredClusters(ctx context.Context) ([]Cluster, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT c.id, c.name, c.tags, c.backup_path, c.created_at, c.updated_at
+		 FROM clusters c JOIN nodes n ON n.cluster_id = c.id
+		 WHERE n.monitoring_enabled = true
+		 ORDER BY c.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var clusters []Cluster
+	for rows.Next() {
+		var c Cluster
+		if err := rows.Scan(&c.ID, &c.Name, &c.Tags, &c.BackupPath, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		clusters = append(clusters, c)
+	}
+
+	for i := range clusters {
+		nodes, err := s.listNodes(ctx, clusters[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		clusters[i].Nodes = nodes
+	}
+	return clusters, nil
 }
 
 func ValidateCluster(c Cluster) error {

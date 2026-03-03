@@ -16,6 +16,7 @@ const (
 	tier1RingCap = 600 // ~20 min at 2s
 	tier2RingCap = 60  // ~30 min at 30s
 	tier3RingCap = 12  // ~1 hr at 5min
+	slowQueryCap = 500 // max slow query entries kept in memory
 )
 
 type nodeMonitor struct {
@@ -41,26 +42,34 @@ type nodeMonitor struct {
 	tier2Ring []Tier2Snapshot
 	tier3Ring []Tier3Snapshot
 
+	// Slow query log ring buffer.
+	slowQueries []SlowQueryEntry
+	seenSlowPIDs map[int32]time.Time
+
 	// Previous raw counters for delta computation.
 	prevDB          *rawDBStats
 	prevDBTime      time.Time
 	prevCkpt        *rawCheckpointerStats
 	prevCkptTime    time.Time
+	prevWAL         *rawWALStats
+	prevWALTime     time.Time
 
 	cancel context.CancelFunc
 }
 
 func newNodeMonitor(clusterID, clusterName string, node cluster.Node, cfg TierConfig, logger zerolog.Logger) *nodeMonitor {
 	return &nodeMonitor{
-		clusterID:   clusterID,
-		clusterName: clusterName,
-		node:        node,
-		cfg:         cfg,
-		logger:      logger.With().Str("node", node.ID).Str("host", node.Host).Logger(),
-		status:      "connecting",
-		tier1Ring:   make([]Tier1Snapshot, 0, tier1RingCap),
-		tier2Ring:   make([]Tier2Snapshot, 0, tier2RingCap),
-		tier3Ring:   make([]Tier3Snapshot, 0, tier3RingCap),
+		clusterID:    clusterID,
+		clusterName:  clusterName,
+		node:         node,
+		cfg:          cfg,
+		logger:       logger.With().Str("node", node.ID).Str("host", node.Host).Logger(),
+		status:       "connecting",
+		tier1Ring:    make([]Tier1Snapshot, 0, tier1RingCap),
+		tier2Ring:    make([]Tier2Snapshot, 0, tier2RingCap),
+		tier3Ring:    make([]Tier3Snapshot, 0, tier3RingCap),
+		slowQueries:  make([]SlowQueryEntry, 0, slowQueryCap),
+		seenSlowPIDs: make(map[int32]time.Time),
 	}
 }
 
@@ -293,6 +302,26 @@ func (nm *nodeMonitor) collectTier1(ctx context.Context) error {
 	}
 	snap.Checkpointer = nm.computeCkptDeltas(rawCk)
 
+	// WAL stats (PG14+).
+	if nm.pgVersion >= 140000 {
+		var rawW rawWALStats
+		err = conn.QueryRow(ctx, WALStatsQueryPG14).Scan(
+			&rawW.WALRecords, &rawW.WALFpi, &rawW.WALBytes,
+			&rawW.StatsReset,
+		)
+		if err != nil {
+			nm.logger.Debug().Err(err).Msg("wal stats query failed")
+		} else {
+			snap.WAL = nm.computeWALDeltas(rawW)
+		}
+
+		// Archive pending (best-effort, may fail without superuser).
+		var pending int
+		if err := conn.QueryRow(ctx, ArchivePendingQuery).Scan(&pending); err == nil {
+			snap.WAL.ArchivePending = pending
+		}
+	}
+
 	// Replication.
 	var repl ReplicationInfo
 	err = conn.QueryRow(ctx, ReplicationLagQuery).Scan(
@@ -317,12 +346,49 @@ func (nm *nodeMonitor) collectTier1(ctx context.Context) error {
 	}
 	snap.Replication = repl
 
+	// Collect slow queries (>5 seconds) into log.
+	nm.collectSlowQueries(ctx, conn)
+
 	// Store.
 	nm.mu.Lock()
 	nm.tier1 = &snap
 	nm.tier1Ring = appendRing(nm.tier1Ring, snap, tier1RingCap)
 	nm.mu.Unlock()
 	return nil
+}
+
+func (nm *nodeMonitor) collectSlowQueries(ctx context.Context, conn *pgx.Conn) {
+	rows, err := conn.Query(ctx, SlowQueriesQuery, 5.0, 50)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	now := time.Now()
+	for rows.Next() {
+		var e SlowQueryEntry
+		if err := rows.Scan(&e.PID, &e.Datname, &e.Usename, &e.DurationSec, &e.Query, &e.WaitEvent, &e.State); err != nil {
+			break
+		}
+		e.Timestamp = now
+
+		nm.mu.Lock()
+		// Only log if we haven't seen this PID in the last 30 seconds (avoid duplicates).
+		if lastSeen, ok := nm.seenSlowPIDs[e.PID]; !ok || now.Sub(lastSeen) > 30*time.Second {
+			nm.slowQueries = appendRing(nm.slowQueries, e, slowQueryCap)
+			nm.seenSlowPIDs[e.PID] = now
+		}
+		nm.mu.Unlock()
+	}
+
+	// Cleanup old PID entries.
+	nm.mu.Lock()
+	for pid, t := range nm.seenSlowPIDs {
+		if now.Sub(t) > 5*time.Minute {
+			delete(nm.seenSlowPIDs, pid)
+		}
+	}
+	nm.mu.Unlock()
 }
 
 func (nm *nodeMonitor) computeDBDeltas(raw rawDBStats) DatabaseStats {
@@ -397,6 +463,33 @@ func (nm *nodeMonitor) computeCkptDeltas(raw rawCheckpointerStats) CheckpointerS
 		BuffersCleanRate:      float64(raw.BuffersClean-prev.BuffersClean) / elapsed,
 		BuffersBackendRate:    float64(raw.BuffersBackend-prev.BuffersBackend) / elapsed,
 		MaxWrittenCleanRate:   float64(raw.MaxWrittenClean-prev.MaxWrittenClean) / elapsed,
+	}
+}
+
+func (nm *nodeMonitor) computeWALDeltas(raw rawWALStats) WALStats {
+	now := time.Now()
+	defer func() {
+		nm.prevWAL = &raw
+		nm.prevWALTime = now
+	}()
+
+	if nm.prevWAL == nil {
+		return WALStats{}
+	}
+	if raw.StatsReset != nm.prevWAL.StatsReset {
+		return WALStats{}
+	}
+
+	elapsed := now.Sub(nm.prevWALTime).Seconds()
+	if elapsed < 0.1 {
+		return WALStats{}
+	}
+
+	prev := nm.prevWAL
+	return WALStats{
+		WALBytesRate:   float64(raw.WALBytes-prev.WALBytes) / elapsed,
+		WALRecordsRate: float64(raw.WALRecords-prev.WALRecords) / elapsed,
+		WALFpiRate:     float64(raw.WALFpi-prev.WALFpi) / elapsed,
 	}
 }
 
@@ -483,6 +576,25 @@ func (nm *nodeMonitor) collectTier2(ctx context.Context) error {
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
+	}
+
+	// Vacuum progress.
+	rows, err = conn.Query(ctx, VacuumProgressQuery)
+	if err != nil {
+		nm.logger.Debug().Err(err).Msg("vacuum progress query failed")
+	} else {
+		for rows.Next() {
+			var v VacuumProgress
+			if err := rows.Scan(&v.PID, &v.Schema, &v.Table, &v.Phase, &v.HeapBlksTotal, &v.HeapBlksScanned); err != nil {
+				rows.Close()
+				break
+			}
+			if v.HeapBlksTotal > 0 {
+				v.PercentDone = float64(v.HeapBlksScanned) / float64(v.HeapBlksTotal) * 100
+			}
+			snap.VacuumProgress = append(snap.VacuumProgress, v)
+		}
+		rows.Close()
 	}
 
 	nm.mu.Lock()
@@ -617,6 +729,14 @@ func (nm *nodeMonitor) tier1History() []Tier1Snapshot {
 	defer nm.mu.RUnlock()
 	out := make([]Tier1Snapshot, len(nm.tier1Ring))
 	copy(out, nm.tier1Ring)
+	return out
+}
+
+func (nm *nodeMonitor) getSlowQueries() []SlowQueryEntry {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	out := make([]SlowQueryEntry, len(nm.slowQueries))
+	copy(out, nm.slowQueries)
 	return out
 }
 

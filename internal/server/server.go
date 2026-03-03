@@ -137,10 +137,12 @@ func (s *Server) Start(ctx context.Context, listen string, port int) error {
 		mux.HandleFunc("GET /api/v1/monitoring/status", moh.status)
 		mux.HandleFunc("POST /api/v1/monitoring/start", moh.startMonitoring)
 		mux.HandleFunc("POST /api/v1/monitoring/stop", moh.stopMonitoring)
+		mux.HandleFunc("POST /api/v1/monitoring/toggle", moh.toggleMonitoring)
 		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}", moh.overview)
 		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/tables", moh.nodeTableStats)
 		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/sizes", moh.nodeSizes)
 		mux.HandleFunc("POST /api/v1/monitoring/{clusterId}/nodes/{nodeId}/refresh-sizes", moh.refreshSizes)
+		mux.HandleFunc("GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/slow-queries", moh.slowQueries)
 	}
 
 	// Serve embedded frontend with SPA fallback.

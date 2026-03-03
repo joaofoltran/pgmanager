@@ -8,9 +8,11 @@ interface Props {
 
 export function TableStatsSection({ tier2 }: Props) {
   const [expanded, setExpanded] = useState(false);
-  const [tab, setTab] = useState<"tables" | "indexes" | "locks">("tables");
+  const [tab, setTab] = useState<"tables" | "indexes" | "locks" | "vacuum">("tables");
 
   if (!tier2) return null;
+
+  const vacuums = tier2.vacuum_progress ?? [];
 
   const unusedIndexes = (tier2.indexes ?? []).filter((i) => i.idx_scan === 0);
   const deadTupTables = (tier2.tables ?? []).filter(
@@ -48,7 +50,7 @@ export function TableStatsSection({ tier2 }: Props) {
       {expanded && (
         <div className="border-t px-4 pb-4" style={{ borderColor: "var(--color-border)" }}>
           <div className="flex gap-1 mt-3 mb-3">
-            {(["tables", "indexes", "locks"] as const).map((t) => (
+            {(["tables", "indexes", "locks", "vacuum"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -60,6 +62,7 @@ export function TableStatsSection({ tier2 }: Props) {
               >
                 {t.charAt(0).toUpperCase() + t.slice(1)}
                 {t === "locks" && tier2.locks?.length ? ` (${tier2.locks.length})` : ""}
+                {t === "vacuum" && vacuums.length ? ` (${vacuums.length})` : ""}
               </button>
             ))}
           </div>
@@ -67,6 +70,7 @@ export function TableStatsSection({ tier2 }: Props) {
           {tab === "tables" && <TablesTab tables={tier2.tables ?? []} />}
           {tab === "indexes" && <IndexesTab indexes={tier2.indexes ?? []} />}
           {tab === "locks" && <LocksTab locks={tier2.locks ?? []} />}
+          {tab === "vacuum" && <VacuumTab vacuums={vacuums} />}
         </div>
       )}
     </div>
@@ -215,6 +219,58 @@ function LocksTab({ locks }: { locks: NonNullable<NonNullable<Props["tier2"]>>["
               </td>
               <td className="py-1.5 px-2 font-mono" style={{ color: "var(--color-text-muted)" }}>
                 {l.relation || "—"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function VacuumTab({ vacuums }: { vacuums: NonNullable<NonNullable<Props["tier2"]>["vacuum_progress"]> }) {
+  if (vacuums.length === 0) {
+    return <EmptyState text="No vacuum operations in progress" />;
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-xs">
+        <thead>
+          <tr style={{ color: "var(--color-text-muted)" }}>
+            <th className="text-left py-1.5 px-2 font-medium">PID</th>
+            <th className="text-left py-1.5 px-2 font-medium">Table</th>
+            <th className="text-left py-1.5 px-2 font-medium">Phase</th>
+            <th className="text-right py-1.5 px-2 font-medium">Progress</th>
+          </tr>
+        </thead>
+        <tbody>
+          {vacuums.map((v) => (
+            <tr
+              key={v.pid}
+              className="border-t"
+              style={{ borderColor: "var(--color-border)" }}
+            >
+              <td className="py-1.5 px-2 font-mono" style={{ color: "var(--color-text)" }}>
+                {v.pid}
+              </td>
+              <td className="py-1.5 px-2 font-mono" style={{ color: "var(--color-text-secondary)" }}>
+                {v.schema}.{v.table}
+              </td>
+              <td className="py-1.5 px-2" style={{ color: "var(--color-text-secondary)" }}>
+                {v.phase}
+              </td>
+              <td className="py-1.5 px-2 text-right">
+                <div className="flex items-center gap-2 justify-end">
+                  <div className="w-20 h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: "var(--color-border)" }}>
+                    <div
+                      className="h-full rounded-full"
+                      style={{ width: `${v.percent_done}%`, backgroundColor: "var(--color-accent)" }}
+                    />
+                  </div>
+                  <span className="tabular-nums font-mono" style={{ color: "var(--color-text)" }}>
+                    {v.percent_done.toFixed(1)}%
+                  </span>
+                </div>
               </td>
             </tr>
           ))}

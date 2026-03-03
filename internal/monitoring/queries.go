@@ -74,6 +74,23 @@ SELECT
     COALESCE(EXTRACT(EPOCH FROM stats_reset), 0) AS stats_reset_epoch
 FROM pg_stat_bgwriter`
 
+// WALStatsQueryPG14 reads from pg_stat_wal (PG14+).
+const WALStatsQueryPG14 = `
+SELECT
+    wal_records, wal_fpi, wal_bytes,
+    COALESCE(EXTRACT(EPOCH FROM stats_reset), 0) AS stats_reset_epoch
+FROM pg_stat_wal`
+
+// ArchiveStatsQuery reads archive pending/fail counts.
+const ArchiveStatsQuery = `
+SELECT
+    COALESCE(last_failed_count, 0)
+FROM pg_stat_archiver`
+
+// ArchivePendingQuery counts ready WAL files.
+const ArchivePendingQuery = `
+SELECT count(*) FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'`
+
 // ReplicationLagQuery checks replica lag from shared memory functions.
 const ReplicationLagQuery = `
 SELECT
@@ -96,6 +113,26 @@ SELECT
     COALESCE(flush_lag::text, '0'),
     COALESCE(replay_lag::text, '0')
 FROM pg_stat_replication`
+
+// SlowQueriesQuery returns currently running queries above a duration threshold.
+// $1 = minimum seconds, $2 = max rows.
+const SlowQueriesQuery = `
+SELECT
+    pid,
+    COALESCE(datname, ''),
+    COALESCE(usename, ''),
+    EXTRACT(EPOCH FROM clock_timestamp() - query_start) AS duration_sec,
+    left(query, 100),
+    COALESCE(wait_event_type || ':' || wait_event, ''),
+    COALESCE(state, 'unknown')
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND state = 'active'
+  AND query NOT LIKE 'autovacuum:%'
+  AND pid != pg_backend_pid()
+  AND EXTRACT(EPOCH FROM clock_timestamp() - query_start) > $1
+ORDER BY query_start ASC
+LIMIT $2`
 
 // ---------------------------------------------------------------------------
 // Tier 2 — shared memory views, but bounded by LIMIT + schema filter
@@ -157,6 +194,20 @@ JOIN pg_locks blocking
     AND blocking.granted
 WHERE NOT blocked.granted
 LIMIT 50`
+
+// VacuumProgressQuery captures currently running vacuum operations.
+const VacuumProgressQuery = `
+SELECT
+    p.pid,
+    n.nspname,
+    c.relname,
+    p.phase,
+    p.heap_blks_total,
+    p.heap_blks_scanned
+FROM pg_stat_progress_vacuum p
+JOIN pg_class c ON c.oid = p.relid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+ORDER BY p.pid`
 
 // ---------------------------------------------------------------------------
 // Tier 3 — expensive, infrequent or on-demand only

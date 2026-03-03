@@ -69,6 +69,64 @@ func (mh *monitoringHandlers) refreshSizes(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, map[string]any{"ok": true})
 }
 
+// GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/slow-queries
+func (mh *monitoringHandlers) slowQueries(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("nodeId")
+	if nodeID == "" {
+		http.Error(w, "node id required", http.StatusBadRequest)
+		return
+	}
+	data := mh.collector.GetSlowQueries(nodeID)
+	if data == nil {
+		data = []monitoring.SlowQueryEntry{}
+	}
+	writeJSON(w, data)
+}
+
+type toggleMonitoringRequest struct {
+	ClusterID string `json:"cluster_id"`
+	NodeID    string `json:"node_id"`
+	Enabled   bool   `json:"enabled"`
+}
+
+// POST /api/v1/monitoring/toggle
+func (mh *monitoringHandlers) toggleMonitoring(w http.ResponseWriter, r *http.Request) {
+	var req toggleMonitoringRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ClusterID == "" || req.NodeID == "" {
+		http.Error(w, "cluster_id and node_id required", http.StatusBadRequest)
+		return
+	}
+
+	if err := mh.clusters.SetNodeMonitoring(r.Context(), req.ClusterID, req.NodeID, req.Enabled); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if req.Enabled {
+		cl, ok, err := mh.clusters.Get(r.Context(), req.ClusterID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "cluster not found", http.StatusNotFound)
+			return
+		}
+		if err := mh.collector.StartNode(context.Background(), cl, req.NodeID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		mh.collector.StopNode(req.NodeID)
+	}
+
+	writeJSON(w, map[string]any{"ok": true, "node_id": req.NodeID, "enabled": req.Enabled})
+}
+
 type monitoringActionRequest struct {
 	ClusterID string `json:"cluster_id"`
 }

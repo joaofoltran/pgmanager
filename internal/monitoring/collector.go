@@ -31,13 +31,36 @@ func NewCollector(clusters *cluster.Store, logger zerolog.Logger, cfg TierConfig
 	}
 }
 
-// StartCluster begins monitoring all nodes in a cluster.
+// AutoStart starts monitoring for all clusters that have monitoring_enabled nodes.
+// Called once at daemon boot.
+func (c *Collector) AutoStart(ctx context.Context) error {
+	monitored, err := c.clusters.ListMonitoredClusters(ctx)
+	if err != nil {
+		return fmt.Errorf("list monitored clusters: %w", err)
+	}
+
+	for _, cl := range monitored {
+		if err := c.StartCluster(ctx, cl); err != nil {
+			c.logger.Warn().Err(err).Str("cluster", cl.ID).Msg("auto-start monitoring failed")
+		}
+	}
+
+	if len(monitored) > 0 {
+		c.logger.Info().Int("clusters", len(monitored)).Msg("auto-started monitoring")
+	}
+	return nil
+}
+
+// StartCluster begins monitoring all enabled nodes in a cluster.
 func (c *Collector) StartCluster(ctx context.Context, cl cluster.Cluster) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	started := 0
 	for _, node := range cl.Nodes {
+		if !node.MonitoringEnabled {
+			continue
+		}
 		if _, exists := c.nodes[node.ID]; exists {
 			continue
 		}
@@ -53,6 +76,39 @@ func (c *Collector) StartCluster(ctx context.Context, cl cluster.Cluster) error 
 		Int("nodes_started", started).
 		Msg("monitoring started")
 	return nil
+}
+
+// StartNode begins monitoring a single node.
+func (c *Collector) StartNode(ctx context.Context, cl cluster.Cluster, nodeID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.nodes[nodeID]; exists {
+		return nil
+	}
+
+	for _, node := range cl.Nodes {
+		if node.ID == nodeID {
+			nm := newNodeMonitor(cl.ID, cl.Name, node, c.config, c.logger)
+			c.nodes[node.ID] = nm
+			go nm.run(ctx)
+			c.logger.Info().Str("node", nodeID).Str("cluster", cl.ID).Msg("node monitoring started")
+			return nil
+		}
+	}
+	return fmt.Errorf("node %q not found in cluster %q", nodeID, cl.ID)
+}
+
+// StopNode stops monitoring a single node.
+func (c *Collector) StopNode(nodeID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if nm, ok := c.nodes[nodeID]; ok {
+		nm.stop()
+		delete(c.nodes, nodeID)
+		c.logger.Info().Str("node", nodeID).Msg("node monitoring stopped")
+	}
 }
 
 // StopCluster stops monitoring all nodes in a cluster.
@@ -81,6 +137,14 @@ func (c *Collector) IsMonitoring(clusterID string) bool {
 		}
 	}
 	return false
+}
+
+// IsNodeMonitoring returns true if a specific node is being monitored.
+func (c *Collector) IsNodeMonitoring(nodeID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.nodes[nodeID]
+	return ok
 }
 
 // MonitoredClusterIDs returns the IDs of all clusters being monitored.
@@ -144,6 +208,17 @@ func (c *Collector) GetTier3(nodeID string) *Tier3Snapshot {
 		return nil
 	}
 	return nm.latestTier3()
+}
+
+// GetSlowQueries returns the slow query log for a specific node.
+func (c *Collector) GetSlowQueries(nodeID string) []SlowQueryEntry {
+	c.mu.RLock()
+	nm, ok := c.nodes[nodeID]
+	c.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return nm.getSlowQueries()
 }
 
 // RefreshTier3 triggers an immediate Tier 3 collection for a node.
