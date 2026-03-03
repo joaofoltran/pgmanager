@@ -63,6 +63,15 @@ type CheckpointerStats struct {
 	MaxWrittenCleanRate   float64 `json:"maxwritten_clean_rate"`
 }
 
+// WALStats captures WAL generation and archiving metrics.
+type WALStats struct {
+	WALBytesRate    float64 `json:"wal_bytes_rate"`
+	WALRecordsRate  float64 `json:"wal_records_rate"`
+	WALFpiRate      float64 `json:"wal_fpi_rate"`
+	ArchivePending  int     `json:"archive_pending"`
+	ArchiveFailRate float64 `json:"archive_fail_rate"`
+}
+
 // ReplicationInfo captures replication state.
 type ReplicationInfo struct {
 	IsReplica      bool          `json:"is_replica"`
@@ -88,6 +97,7 @@ type Tier1Snapshot struct {
 	Activity     ActivitySnapshot   `json:"activity"`
 	Database     DatabaseStats      `json:"database"`
 	Checkpointer CheckpointerStats `json:"checkpointer"`
+	WAL          WALStats           `json:"wal"`
 	Replication  ReplicationInfo    `json:"replication"`
 }
 
@@ -136,13 +146,25 @@ type LockInfo struct {
 	Granted     bool   `json:"granted"`
 }
 
+// VacuumProgress captures in-progress vacuum operations.
+type VacuumProgress struct {
+	PID           int32   `json:"pid"`
+	Schema        string  `json:"schema"`
+	Table         string  `json:"table"`
+	Phase         string  `json:"phase"`
+	HeapBlksTotal int64   `json:"heap_blks_total"`
+	HeapBlksScanned int64 `json:"heap_blks_scanned"`
+	PercentDone   float64 `json:"percent_done"`
+}
+
 // Tier2Snapshot is the complete Tier 2 snapshot for a single node.
 type Tier2Snapshot struct {
-	Timestamp time.Time   `json:"timestamp"`
-	NodeID    string      `json:"node_id"`
-	Tables    []TableStat `json:"tables"`
-	Indexes   []IndexStat `json:"indexes"`
-	Locks     []LockInfo  `json:"locks"`
+	Timestamp       time.Time        `json:"timestamp"`
+	NodeID          string           `json:"node_id"`
+	Tables          []TableStat      `json:"tables"`
+	Indexes         []IndexStat      `json:"indexes"`
+	Locks           []LockInfo       `json:"locks"`
+	VacuumProgress  []VacuumProgress `json:"vacuum_progress,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +211,22 @@ type Tier3Snapshot struct {
 	Sizes      []RelationSize  `json:"sizes,omitempty"`
 	Bloat      []BloatEstimate `json:"bloat,omitempty"`
 	TopQueries []TopQuery      `json:"top_queries,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Slow query log — kept in memory ring buffer, exposed via API
+// ---------------------------------------------------------------------------
+
+// SlowQueryEntry captures a query seen running longer than a threshold.
+type SlowQueryEntry struct {
+	Timestamp    time.Time `json:"timestamp"`
+	PID          int32     `json:"pid"`
+	Datname      string    `json:"datname"`
+	Usename      string    `json:"usename"`
+	DurationSec  float64   `json:"duration_sec"`
+	Query        string    `json:"query"`
+	WaitEvent    string    `json:"wait_event,omitempty"`
+	State        string    `json:"state"`
 }
 
 // ---------------------------------------------------------------------------
@@ -246,4 +284,13 @@ type rawCheckpointerStats struct {
 	BuffersBackend    int64
 	MaxWrittenClean   int64
 	StatsReset        float64
+}
+
+// rawWALStats holds raw cumulative WAL counters.
+type rawWALStats struct {
+	WALRecords   int64
+	WALFpi       int64
+	WALBytes     int64
+	ArchiveFail  int64
+	StatsReset   float64
 }

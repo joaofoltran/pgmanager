@@ -247,6 +247,7 @@ function AddClusterForm({
             user: user || undefined,
             password: password || undefined,
             dbname: dbname || undefined,
+            monitoring_enabled: false,
           },
         ],
       });

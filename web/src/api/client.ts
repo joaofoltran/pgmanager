@@ -6,6 +6,7 @@ import type {
   MonitoringOverview,
   Tier2Snapshot,
   Tier3Snapshot,
+  SlowQueryEntry,
 } from "../types/monitoring";
 
 const BASE = "";
@@ -325,6 +326,33 @@ export async function fetchMonitoringStatus(): Promise<{
   monitored_clusters: string[];
 }> {
   const res = await fetch(`${BASE}/api/v1/monitoring/status`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function toggleNodeMonitoring(
+  clusterId: string,
+  nodeId: string,
+  enabled: boolean
+): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/monitoring/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cluster_id: clusterId, node_id: nodeId, enabled }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body || `HTTP ${res.status}`);
+  }
+}
+
+export async function fetchSlowQueries(
+  clusterId: string,
+  nodeId: string
+): Promise<SlowQueryEntry[]> {
+  const res = await fetch(
+    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(nodeId)}/slow-queries`
+  );
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }

@@ -1,92 +1,270 @@
-# Monitoring Module — Design Decisions
+# Monitoring Module
 
-## Core Constraint
+## Overview
 
-**Our monitoring must not hurt the databases it monitors.** This means:
-1. No polluting shared_buffers (destroying cache hit ratio)
-2. No expensive queries at high frequency
-3. Must scale to customers with thousands of tables/schemas/databases
+Real-time PostgreSQL monitoring via a tiered polling architecture. Collects metrics from shared memory views at different frequencies based on query cost. Designed to never hurt the databases it monitors.
 
-## Tiered Polling Architecture
+## File Map
 
-We split metrics into three tiers based on their cost to collect:
+### Backend — `internal/monitoring/`
+
+| File | Purpose |
+|------|---------|
+| `types.go` | All data structures: tier configs, snapshots (Tier1/2/3), API response types, internal raw counter types |
+| `collector.go` | `Collector` — top-level manager, maps clusterID→nodeMonitors, thread-safe, exposed to HTTP handlers |
+| `node_monitor.go` | `nodeMonitor` — per-node goroutine with dedicated `*pgx.Conn`, runs tiered tickers, delta computation, ring buffers |
+| `queries.go` | All SQL queries as `const` strings, organized by tier, with inline comments explaining cost/safety |
+
+### Server — `internal/server/`
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `monitoring.go` | full file | `monitoringHandlers` struct — 7 HTTP handlers for start/stop/status/overview/tables/sizes/refresh |
+| `server.go` | ~68-71, ~134-143 | `SetMonitoringCollector()` wiring + route registration (guarded by `s.monitoring != nil`) |
+
+### Frontend — `web/src/`
+
+| File | Purpose |
+|------|---------|
+| `types/monitoring.ts` | TypeScript mirrors of all Go types — 1:1 match with `types.go` |
+| `api/client.ts` | 7 fetch functions: `fetchMonitoringOverview`, `fetchNodeTableStats`, `fetchNodeSizes`, `refreshNodeSizes`, `startMonitoring`, `stopMonitoring`, `fetchMonitoringStatus` |
+| `hooks/useMonitoring.ts` | `useMonitoring(clusterId)` — polls Tier 1 at 2s, Tier 2 at 30s per node |
+| `pages/MonitoringPage.tsx` | Main dashboard — cluster selector, start/stop buttons, composes all sections |
+| `components/monitoring/OverviewCards.tsx` | 4 cards: Connections, TPS, Cache Hit Ratio, Replication |
+| `components/monitoring/ActivitySection.tsx` | Connection states breakdown, wait events, longest running query |
+| `components/monitoring/PerformanceCharts.tsx` | 4 recharts `LineChart`s: TPS, Cache Hit %, Active Queries, Block Reads/s |
+| `components/monitoring/TableStatsSection.tsx` | Expandable section with 3 tabs: Tables, Indexes (with "unused" badges), Locks |
+| `components/monitoring/SizesSection.tsx` | On-demand Tier 3: Sizes, Bloat, Top Queries tabs with manual Refresh button |
+
+## Architecture
+
+```
+MonitoringPage (React)
+  │
+  ├── useMonitoring hook ──(HTTP 2s)──► GET /api/v1/monitoring/{clusterId}
+  │                        (HTTP 30s)──► GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/tables
+  │
+  └── SizesSection ───(on-demand)────► POST .../refresh-sizes + GET .../sizes
+                                              │
+                                              ▼
+                                    server.monitoringHandlers
+                                              │
+                                              ▼
+                                    monitoring.Collector
+                                         │
+                                    ┌────┴────┐
+                                    ▼         ▼
+                              nodeMonitor   nodeMonitor
+                              (goroutine)   (goroutine)
+                                    │         │
+                              *pgx.Conn    *pgx.Conn
+                                    │         │
+                                    ▼         ▼
+                                 PG Node   PG Node
+```
+
+## Tiered Polling
 
 ### Tier 1 — Lightweight (default: every 2s)
 
 **Queries:** `pg_stat_activity`, `pg_stat_database`, `pg_stat_bgwriter`/`pg_stat_checkpointer`, `pg_stat_replication`
 
-**Why it's safe:** These PostgreSQL views read from **shared memory stats structures** maintained by the stats collector process. They do NOT access shared_buffers or read heap/index pages. Specifically:
-- `pg_stat_activity` iterates the in-memory `PgBackendStatus` array
-- `pg_stat_database` reads `PgStat_StatDBEntry` structs
-- `pg_stat_bgwriter` reads global shared memory counters
+**Why safe:** These views read from shared memory stats structures (PgBackendStatus, PgStat_StatDBEntry), NOT shared_buffers. Zero cache impact.
 
-Running these every second has **zero impact** on buffer cache.
+**Collects:**
+- `ActivitySnapshot` — connection counts by state, wait events, longest query
+- `DatabaseStats` — cache hit ratio, TPS, tuple rates, temp files, deadlocks (all as **deltas/rates**)
+- `CheckpointerStats` — checkpoint rates, buffer write rates (as deltas)
+- `ReplicationInfo` — replica lag (bytes + seconds), standby list for primaries
+
+**Ring buffer:** 600 entries (~20 min history)
 
 ### Tier 2 — Medium (default: every 30s)
 
 **Queries:** `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_locks`
 
-**Why it needs care:** While these are also shared memory views, they can return thousands of rows for large schemas. We mitigate with:
-- `WHERE schemaname = ANY($1)` — optional schema filter
-- `LIMIT $2` — always bounded (default 100)
-- `ORDER BY` activity metrics (scans, dead tuples) so the most interesting tables come first
+**Mitigations:** Schema filter (`$1::text[]`), `LIMIT $2` (default 100/50), ORDER BY activity.
 
-### Tier 3 — Heavy (default: every 5min or on-demand)
+**Collects:**
+- `TableStat[]` — seq scans, index usage ratio, live/dead tuples, vacuum timestamps
+- `IndexStat[]` — scan counts, size (sorted ascending to surface unused indexes first)
+- `LockInfo[]` — blocked lock relationships only (WHERE NOT granted)
 
-**Queries:** `pg_total_relation_size()`, bloat estimation, `pg_stat_statements`
+**Ring buffer:** 60 entries (~30 min)
 
-**Why it's expensive:** `pg_total_relation_size()` calls `stat()` on relation files and reads `pg_class` catalog entries — this DOES touch shared_buffers. Bloat estimation joins `pg_stats`. We mitigate with:
-- Infrequent polling (5min default) or purely on-demand (user clicks "Refresh")
-- `ORDER BY relpages DESC` — `relpages` is a cached estimate in `pg_class` (no I/O), so we sort cheaply and only call the expensive size functions on the top N
-- `LIMIT $2` — always bounded (default 50)
+### Tier 3 — Heavy (default: every 5 min or on-demand)
 
-## Delta-Based Rate Computation
+**Queries:** `pg_total_relation_size()`, bloat estimation via `pg_stats`, `pg_stat_statements`
 
-All cumulative counters (transactions, blocks read/hit, tuples inserted/updated/deleted, etc.) are stored as raw values. We compute rates in Go:
+**Why expensive:** `pg_total_relation_size()` calls `stat()` on files and reads catalog → touches shared_buffers.
 
-```
-rate = (current_value - previous_value) / elapsed_seconds
-```
+**Mitigations:** ORDER BY `relpages` (cached estimate, no I/O), LIMIT, on-demand via UI "Refresh" button.
 
-This is critical because:
-- We never ask PostgreSQL to compute rates (no `pg_stat_get_*` rate functions, no window functions over stats)
-- Delta computation handles counter wraps and stats resets gracefully
-- We detect `stats_reset` timestamp changes and discard one sample on reset
+**Collects:**
+- `RelationSize[]` — total/data/index/toast bytes per table
+- `BloatEstimate[]` — statistics-based estimation (no pgstattuple extension needed)
+- `TopQuery[]` — from pg_stat_statements (gracefully skipped if extension not installed)
 
-## Cache Hit Ratio Calculation
+**Ring buffer:** 12 entries (~1 hr)
 
-```
-cache_hit_ratio = delta(blks_hit) / (delta(blks_hit) + delta(blks_read))
-```
+## Key Design Decisions
 
-Computed from deltas, not absolute values. This gives the **current** cache hit ratio for the polling interval, not the lifetime average (which hides recent degradation).
+### Delta-Based Rate Computation
 
-## Connection Strategy
+All cumulative counters stored as raw values. Rates computed in Go: `rate = (current - previous) / elapsed_seconds`. Handles stats resets by comparing `stats_reset` epoch — discards one sample on reset.
 
-- **One dedicated `*pgx.Conn` per monitored node** (not from a pool)
-- Connection settings: `statement_timeout=5s`, `idle_in_transaction_session_timeout=10s`, `application_name=pgmanager_monitoring`
-- On connection failure: exponential backoff (1s, 2s, 4s... max 30s)
-- PG version detected on connect (`SHOW server_version_num`) for query selection (e.g., PG17+ has `pg_stat_checkpointer` instead of checkpoint columns in `pg_stat_bgwriter`)
+Cache hit ratio is computed from deltas (current interval), not lifetime averages.
 
-## Scale Strategy
+### Connection Strategy
 
-For environments with many databases/schemas/relations:
+- One dedicated `*pgx.Conn` per node (not pooled)
+- `application_name=pgmanager_monitoring`, `statement_timeout=5s`, `idle_in_transaction_session_timeout=10s`
+- Exponential backoff on failure: 1s → 2s → 4s → ... → max 30s
+- PG version detected on connect for query selection (PG17+ `pg_stat_checkpointer`)
 
-1. **All Tier 2/3 queries accept schema filter + LIMIT** — the API exposes `?schemas=public,app&limit=100` parameters
-2. **Ring buffers have fixed capacity** — 600 entries for T1 (~20min at 2s), 60 for T2 (~30min at 30s), 12 for T3 (~1hr at 5min). Memory is bounded regardless of collection count.
-3. **Tier 1 is O(1) w.r.t. database objects** — `pg_stat_database` returns one row per database, `pg_stat_activity` is bounded by `max_connections`
-4. **No automatic full-catalog scans** — Tier 3 is on-demand by default; automatic polling requires explicit opt-in
+### Scale Strategy
 
-## PG Version Compatibility
+- All Tier 2/3 queries accept schema filter + LIMIT
+- Ring buffers have fixed capacity — memory bounded regardless of collection count
+- Tier 1 is O(1) w.r.t. database objects
+- No automatic full-catalog scans — Tier 3 is on-demand by default
 
-- **PG12+**: Full support (pgoutput, pg_stat_activity with backend_type)
-- **PG14+**: `query_id` in pg_stat_activity
-- **PG17+**: `pg_stat_checkpointer` replaces checkpoint columns in `pg_stat_bgwriter`
-- **pg_stat_statements**: Optional — gracefully handled if extension is not installed
+### PG Version Compatibility
 
-## Frontend Polling Strategy
+- **PG12+**: Full support
+- **PG17+**: Uses `pg_stat_checkpointer` instead of checkpoint columns in `pg_stat_bgwriter`
+- **pg_stat_statements**: Optional — gracefully handled if not installed
 
-- Tier 1: HTTP polling every 2s (not WebSocket — monitoring is separate from migration real-time stream)
-- Tier 2: HTTP polling every 30s, only when the tables section is expanded
+### Frontend Strategy
+
+- Tier 1: HTTP polling every 2s (not WebSocket — separate from migration real-time stream)
+- Tier 2: HTTP polling every 30s, only when nodes exist in overview
 - Tier 3: Fetched on-demand when user clicks "Refresh Sizes"
-- History for charts maintained client-side from T1 polling responses
+- History for charts maintained from Tier 1 polling responses (server-side ring buffer)
+- Charts use `recharts` library (LineChart)
+
+## REST API
+
+| Method | Endpoint | Handler | Description |
+|--------|----------|---------|-------------|
+| GET | `/api/v1/monitoring/status` | `status` | List monitored cluster IDs |
+| POST | `/api/v1/monitoring/start` | `startMonitoring` | Start monitoring a cluster (body: `{cluster_id}`) |
+| POST | `/api/v1/monitoring/stop` | `stopMonitoring` | Stop monitoring a cluster (body: `{cluster_id}`) |
+| GET | `/api/v1/monitoring/{clusterId}` | `overview` | Full overview: all nodes' Tier1+2+3 + history |
+| GET | `/api/v1/monitoring/{clusterId}/nodes/{nodeId}/tables` | `nodeTableStats` | Tier 2 data for a node |
+| GET | `/api/v1/monitoring/{clusterId}/nodes/{nodeId}/sizes` | `nodeSizes` | Tier 3 data for a node |
+| POST | `/api/v1/monitoring/{clusterId}/nodes/{nodeId}/refresh-sizes` | `refreshSizes` | Trigger immediate Tier 3 collection |
+
+## Key Types
+
+### Go (`types.go`)
+
+```
+TierConfig                     — polling intervals per tier
+ActivitySnapshot               — pg_stat_activity aggregation
+DatabaseStats                  — pg_stat_database rates (deltas)
+CheckpointerStats              — checkpoint/bgwriter rates (deltas)
+ReplicationInfo + StandbyInfo  — replication state
+Tier1Snapshot                  — composite of above, timestamped
+TableStat                      — per-table pg_stat_user_tables
+IndexStat                      — per-index stats + size
+LockInfo                       — blocked lock pairs
+Tier2Snapshot                  — tables + indexes + locks
+RelationSize                   — total/data/index/toast breakdown
+BloatEstimate                  — statistics-based bloat
+TopQuery                       — pg_stat_statements top N
+Tier3Snapshot                  — sizes + bloat + top queries
+NodeMonitoringSnapshot         — per-node combined state (status + all tiers)
+MonitoringOverview             — per-cluster API response (nodes[] + history[])
+rawDBStats, rawCheckpointerStats — internal, for delta computation
+```
+
+### TypeScript (`types/monitoring.ts`)
+
+1:1 mirror of all Go types above. TypeScript uses `snake_case` matching JSON tags.
+
+## SQL Queries (`queries.go`)
+
+| Constant | Tier | Source View | Notes |
+|----------|------|-------------|-------|
+| `ActivityQuery` | 1 | `pg_stat_activity` | Single-row aggregate, filters `backend_type = 'client backend'` |
+| `ActivityByStateQuery` | 1 | `pg_stat_activity` | GROUP BY state |
+| `ActivityByWaitEventQuery` | 1 | `pg_stat_activity` | GROUP BY wait_event_type, active only |
+| `LongestQueryQuery` | 1 | `pg_stat_activity` | PID + first 200 chars of query text |
+| `DatabaseStatsQuery` | 1 | `pg_stat_database` | Raw cumulative counters for delta computation |
+| `CheckpointerQueryPG17` | 1 | `pg_stat_checkpointer` | PG17+ only |
+| `CheckpointerQueryLegacy` | 1 | `pg_stat_bgwriter` | PG < 17 |
+| `ReplicationLagQuery` | 1 | `pg_is_in_recovery()`, WAL functions | Lag in bytes + seconds |
+| `StandbyInfoQuery` | 1 | `pg_stat_replication` | Connected standbys on primary |
+| `TableStatsQuery` | 2 | `pg_stat_user_tables` | Schema filter + LIMIT, ordered by scan activity |
+| `IndexStatsQuery` | 2 | `pg_stat_user_indexes` | Includes `pg_relation_size`, ordered ASC (unused first) |
+| `LockContentionQuery` | 2 | `pg_locks` | Self-join for blocked relationships, LIMIT 50 |
+| `RelationSizesQuery` | 3 | `pg_class` + size functions | ORDER BY `relpages` (cached, no I/O) |
+| `BloatEstimateQuery` | 3 | `pg_stat_user_tables` + `pg_stats` | Stats-based, no pgstattuple needed, min 1000 rows |
+| `TopQueriesQuery` | 3 | `pg_stat_statements` | Top N by total_exec_time, gracefully fails |
+
+## Collector Internals (`collector.go` + `node_monitor.go`)
+
+### Collector (thread-safe, one per daemon)
+
+- `nodes map[string]*nodeMonitor` — keyed by nodeID
+- `StartCluster(ctx, cluster)` — spawns nodeMonitor goroutines
+- `StopCluster(clusterID)` — cancels contexts, removes from map
+- `GetOverview(clusterID)` — aggregates all node snapshots + history
+- `GetTier2(nodeID)` / `GetTier3(nodeID)` — per-node accessors
+- `RefreshTier3(ctx, nodeID)` — triggers immediate collection
+- `Close()` — stops everything
+
+### nodeMonitor (one per PG node)
+
+- **Lifecycle:** `run()` → `connect()` (with exponential backoff) → `runTickers()` → on disconnect, reconnects
+- **Tickers:** 3 independent `time.Ticker`s for each tier, immediate collection on start
+- **Tier 1 failure is fatal** (disconnects) — Tier 2/3 failures are non-fatal (logged, continue)
+- **Ring buffers:** Fixed-capacity `appendRing[T]` generic function, oldest items dropped
+- **Delta state:** `prevDB *rawDBStats`, `prevCkpt *rawCheckpointerStats` + timestamps for rate computation
+- **Status:** `"connecting"` → `"ok"` → `"error"` / `"disconnected"` (exposed in API)
+
+## Frontend Components
+
+### MonitoringPage (`pages/MonitoringPage.tsx`)
+
+Entry point. Manages:
+- Cluster list fetching + selection dropdown
+- Start/stop monitoring buttons
+- API-down detection with retry
+- Multi-node status pills (green/red/gray dots)
+- Composes: `OverviewCards` → `ActivitySection` → `PerformanceCharts` → `TableStatsSection` → `SizesSection`
+
+### OverviewCards (`components/monitoring/OverviewCards.tsx`)
+
+4 metric cards from Tier 1 data:
+- **Connections** — active/total of max (red when >80%)
+- **TPS** — commit+rollback rate, rollback/s sub-text
+- **Cache Hit Ratio** — percentage (amber when <95%)
+- **Replication** — lag seconds for replicas, standby count for primaries
+
+### ActivitySection (`components/monitoring/ActivitySection.tsx`)
+
+- Connection states bar (active/idle/idle in tx) with color coding and percentages
+- Wait events breakdown (active queries only)
+- Longest running query text display with PID
+
+### PerformanceCharts (`components/monitoring/PerformanceCharts.tsx`)
+
+4 `recharts` LineCharts from Tier 1 history (last 120 data points):
+- Transactions/sec, Cache Hit Ratio %, Active Queries, Block Reads/sec
+- Shared `ChartCard` helper component
+
+### TableStatsSection (`components/monitoring/TableStatsSection.tsx`)
+
+Expandable section with 3 tabs from Tier 2 data:
+- **Tables** — seq scans, index usage %, live/dead rows, last vacuum (with dead tuple alerts)
+- **Indexes** — scan count, size, "unused" badge for zero-scan indexes
+- **Locks** — waiting/blocking PID pairs with mode and relation
+
+### SizesSection (`components/monitoring/SizesSection.tsx`)
+
+On-demand Tier 3 section with Refresh button:
+- **Sizes** — total/data/index/toast per relation
+- **Bloat** — estimated bloat ratio (red >30%, amber >15%)
+- **Top Queries** — from pg_stat_statements: calls, total time, mean time, hit ratio

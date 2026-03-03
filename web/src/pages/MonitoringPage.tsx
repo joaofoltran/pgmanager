@@ -4,44 +4,45 @@ import {
   Loader2,
   WifiOff,
   RefreshCw,
-  ChevronDown,
   Database,
-  Play,
-  Square,
+  ChevronRight,
 } from "lucide-react";
 import type { Cluster } from "../types/cluster";
 import {
   fetchClusters,
-  startMonitoring,
-  stopMonitoring,
   fetchMonitoringStatus,
 } from "../api/client";
 import { useMonitoring } from "../hooks/useMonitoring";
-import { OverviewCards } from "../components/monitoring/OverviewCards";
-import { ActivitySection } from "../components/monitoring/ActivitySection";
 import { PerformanceCharts } from "../components/monitoring/PerformanceCharts";
+import { ActivitySection } from "../components/monitoring/ActivitySection";
 import { TableStatsSection } from "../components/monitoring/TableStatsSection";
 import { SizesSection } from "../components/monitoring/SizesSection";
+import { SlowQueryLog } from "../components/monitoring/SlowQueryLog";
 
 export function MonitoringPage() {
   const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [monitoredIds, setMonitoredIds] = useState<string[]>([]);
   const [selectedCluster, setSelectedCluster] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [apiDown, setApiDown] = useState(false);
-  const [isMonitored, setIsMonitored] = useState(false);
-  const [starting, setStarting] = useState(false);
 
   const { overview, tier2, loading: metricsLoading } = useMonitoring(
-    isMonitored ? selectedCluster : null
+    selectedCluster || null
   );
 
-  async function loadClusters() {
+  async function loadData() {
     try {
-      const data = await fetchClusters();
+      const [data, status] = await Promise.all([
+        fetchClusters(),
+        fetchMonitoringStatus(),
+      ]);
       setClusters(data || []);
+      const ids = status.monitored_clusters || [];
+      setMonitoredIds(ids);
       setApiDown(false);
-      if (data && data.length > 0 && !selectedCluster) {
-        setSelectedCluster(data[0].id);
+
+      if (ids.length > 0 && !selectedCluster) {
+        setSelectedCluster(ids[0]);
       }
     } catch {
       setClusters([]);
@@ -51,47 +52,16 @@ export function MonitoringPage() {
     }
   }
 
-  async function checkMonitoringStatus(clusterId: string) {
-    try {
-      const status = await fetchMonitoringStatus();
-      setIsMonitored(status.monitored_clusters?.includes(clusterId) ?? false);
-    } catch {
-      setIsMonitored(false);
-    }
-  }
-
   useEffect(() => {
-    loadClusters();
+    loadData();
+    const interval = setInterval(async () => {
+      try {
+        const status = await fetchMonitoringStatus();
+        setMonitoredIds(status.monitored_clusters || []);
+      } catch {}
+    }, 10000);
+    return () => clearInterval(interval);
   }, []);
-
-  useEffect(() => {
-    if (selectedCluster) {
-      checkMonitoringStatus(selectedCluster);
-    }
-  }, [selectedCluster]);
-
-  async function handleStart() {
-    if (!selectedCluster) return;
-    setStarting(true);
-    try {
-      await startMonitoring(selectedCluster);
-      setIsMonitored(true);
-    } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "Failed to start monitoring");
-    } finally {
-      setStarting(false);
-    }
-  }
-
-  async function handleStop() {
-    if (!selectedCluster) return;
-    try {
-      await stopMonitoring(selectedCluster);
-      setIsMonitored(false);
-    } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : "Failed to stop monitoring");
-    }
-  }
 
   if (loading) {
     return (
@@ -101,6 +71,7 @@ export function MonitoringPage() {
     );
   }
 
+  const monitoredClusters = clusters.filter((c) => monitoredIds.includes(c.id));
   const primaryNode = overview?.nodes?.find(
     (n) => n.tier1 && n.status === "ok"
   ) ?? overview?.nodes?.[0];
@@ -129,7 +100,7 @@ export function MonitoringPage() {
             Check that the pgmanager process is running.
           </p>
           <button
-            onClick={() => { setLoading(true); setApiDown(false); loadClusters(); }}
+            onClick={() => { setLoading(true); setApiDown(false); loadData(); }}
             className="mt-4 flex items-center gap-2 mx-auto px-4 py-2 rounded-lg text-sm transition-colors hover:bg-white/5"
             style={{ color: "var(--color-accent)" }}
           >
@@ -138,91 +109,74 @@ export function MonitoringPage() {
         </div>
       )}
 
-      {!apiDown && clusters.length === 0 && (
+      {!apiDown && monitoredClusters.length === 0 && (
         <div
           className="rounded-lg border p-12 text-center"
           style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border)" }}
         >
           <Database className="w-12 h-12 mx-auto mb-4" style={{ color: "var(--color-text-muted)" }} />
           <h3 className="text-sm font-medium mb-1" style={{ color: "var(--color-text)" }}>
-            No clusters registered
+            No clusters monitored
           </h3>
           <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
-            Register a cluster first to start monitoring.
+            Enable monitoring on nodes via the Cluster settings page.
           </p>
         </div>
       )}
 
-      {!apiDown && clusters.length > 0 && (
-        <>
-          <div
-            className="rounded-lg border p-4"
-            style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border)" }}
-          >
-            <div className="flex items-center gap-4">
-              <div className="flex-1">
-                <label className="block text-xs mb-1.5" style={{ color: "var(--color-text-secondary)" }}>
-                  Cluster
-                </label>
-                <div className="relative">
-                  <select
-                    value={selectedCluster}
-                    onChange={(e) => setSelectedCluster(e.target.value)}
-                    className="w-full rounded-md border px-3 py-2 text-sm appearance-none pr-8"
-                    style={{
-                      backgroundColor: "var(--color-bg)",
-                      borderColor: "var(--color-border)",
-                      color: "var(--color-text)",
-                    }}
-                  >
-                    {clusters.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name} ({c.nodes.length} node{c.nodes.length !== 1 ? "s" : ""})
-                      </option>
-                    ))}
-                  </select>
-                  <ChevronDown
-                    className="w-4 h-4 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none"
-                    style={{ color: "var(--color-text-muted)" }}
-                  />
+      {!apiDown && monitoredClusters.length > 0 && !selectedCluster && (
+        <div className="space-y-2">
+          {monitoredClusters.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => setSelectedCluster(c.id)}
+              className="w-full rounded-lg border p-4 flex items-center gap-3 text-left transition-colors hover:border-[var(--color-accent)]/30"
+              style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border)" }}
+            >
+              <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ backgroundColor: "var(--color-accent)" }}>
+                <Activity className="w-4 h-4 text-white" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium" style={{ color: "var(--color-text)" }}>{c.name}</div>
+                <div className="text-xs" style={{ color: "var(--color-text-muted)" }}>
+                  {c.nodes.filter((n) => n.monitoring_enabled).length} node{c.nodes.filter((n) => n.monitoring_enabled).length !== 1 ? "s" : ""} monitored
                 </div>
               </div>
-              <div className="pt-5">
-                {isMonitored ? (
-                  <button
-                    onClick={handleStop}
-                    className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors hover:bg-red-500/10"
-                    style={{ color: "#ef4444" }}
-                  >
-                    <Square className="w-4 h-4" />
-                    Stop
-                  </button>
-                ) : (
-                  <button
-                    onClick={handleStart}
-                    disabled={starting}
-                    className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-                    style={{ backgroundColor: "var(--color-accent)", color: "#fff" }}
-                  >
-                    {starting ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Play className="w-4 h-4" />
-                    )}
-                    Start Monitoring
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
+              <ChevronRight className="w-4 h-4" style={{ color: "var(--color-text-muted)" }} />
+            </button>
+          ))}
+        </div>
+      )}
 
-          {isMonitored && !overview && metricsLoading && (
+      {!apiDown && selectedCluster && (
+        <>
+          {monitoredClusters.length > 1 && (
+            <div className="flex items-center gap-2">
+              {monitoredClusters.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setSelectedCluster(c.id)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                  style={{
+                    backgroundColor: selectedCluster === c.id ? "var(--color-accent)" : "var(--color-surface)",
+                    color: selectedCluster === c.id ? "#fff" : "var(--color-text-secondary)",
+                    borderWidth: 1,
+                    borderColor: selectedCluster === c.id ? "var(--color-accent)" : "var(--color-border)",
+                  }}
+                >
+                  {c.name}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {!overview && metricsLoading && (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="w-6 h-6 animate-spin" style={{ color: "var(--color-accent)" }} />
             </div>
           )}
 
-          {isMonitored && !overview && !metricsLoading && (
+          {!overview && !metricsLoading && (
             <div
               className="rounded-lg border p-12 text-center"
               style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border)" }}
@@ -237,7 +191,7 @@ export function MonitoringPage() {
             </div>
           )}
 
-          {isMonitored && overview && primaryNode && (
+          {overview && primaryNode && (
             <>
               {overview.nodes.length > 1 && (
                 <div className="flex gap-2">
@@ -268,33 +222,18 @@ export function MonitoringPage() {
                 </div>
               )}
 
-              <OverviewCards node={primaryNode} />
+              <PerformanceCharts history={overview.history ?? []} />
 
               {primaryNode.tier1?.activity && (
                 <ActivitySection activity={primaryNode.tier1.activity} />
               )}
 
-              <PerformanceCharts history={overview.history ?? []} />
+              <SlowQueryLog clusterId={selectedCluster} nodeId={primaryNode.node_id} />
 
               <TableStatsSection tier2={tier2[primaryNode.node_id] ?? null} />
 
               <SizesSection clusterId={selectedCluster} nodeId={primaryNode.node_id} />
             </>
-          )}
-
-          {!isMonitored && (
-            <div
-              className="rounded-lg border p-12 text-center"
-              style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border)" }}
-            >
-              <Activity className="w-12 h-12 mx-auto mb-4" style={{ color: "var(--color-text-muted)" }} />
-              <h3 className="text-sm font-medium mb-1" style={{ color: "var(--color-text)" }}>
-                Monitoring not active
-              </h3>
-              <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>
-                Click "Start Monitoring" to begin collecting metrics from this cluster.
-              </p>
-            </div>
           )}
         </>
       )}

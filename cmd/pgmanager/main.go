@@ -99,6 +99,9 @@ func run(parentCtx context.Context) error {
 
 	mon := monitoring.NewCollector(clusters, logger, monitoring.DefaultTierConfig())
 	defer mon.Close()
+	if err := mon.AutoStart(ctx); err != nil {
+		logger.Warn().Err(err).Msg("monitoring auto-start failed")
+	}
 
 	srv := server.New(nil, nil, logger)
 	srv.SetClusterStore(clusters)

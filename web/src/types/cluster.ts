@@ -10,6 +10,7 @@ export interface ClusterNode {
   password?: string;
   dbname?: string;
   agent_url?: string;
+  monitoring_enabled: boolean;
 }
 
 export interface Cluster {

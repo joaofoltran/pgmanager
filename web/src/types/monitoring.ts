@@ -40,6 +40,14 @@ export interface CheckpointerStats {
   maxwritten_clean_rate: number;
 }
 
+export interface WALStats {
+  wal_bytes_rate: number;
+  wal_records_rate: number;
+  wal_fpi_rate: number;
+  archive_pending: number;
+  archive_fail_rate: number;
+}
+
 export interface StandbyInfo {
   application_name: string;
   state: string;
@@ -62,6 +70,7 @@ export interface Tier1Snapshot {
   activity: ActivitySnapshot;
   database: DatabaseStats;
   checkpointer: CheckpointerStats;
+  wal: WALStats;
   replication: ReplicationInfo;
 }
 
@@ -107,12 +116,23 @@ export interface LockInfo {
   granted: boolean;
 }
 
+export interface VacuumProgress {
+  pid: number;
+  schema: string;
+  table: string;
+  phase: string;
+  heap_blks_total: number;
+  heap_blks_scanned: number;
+  percent_done: number;
+}
+
 export interface Tier2Snapshot {
   timestamp: string;
   node_id: string;
   tables: TableStat[];
   indexes: IndexStat[];
   locks: LockInfo[];
+  vacuum_progress?: VacuumProgress[];
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +175,21 @@ export interface Tier3Snapshot {
   sizes?: RelationSize[];
   bloat?: BloatEstimate[];
   top_queries?: TopQuery[];
+}
+
+// ---------------------------------------------------------------------------
+// Slow query log
+// ---------------------------------------------------------------------------
+
+export interface SlowQueryEntry {
+  timestamp: string;
+  pid: number;
+  datname: string;
+  usename: string;
+  duration_sec: number;
+  query: string;
+  wait_event?: string;
+  state: string;
 }
 
 // ---------------------------------------------------------------------------

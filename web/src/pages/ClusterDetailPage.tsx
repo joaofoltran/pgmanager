@@ -20,7 +20,7 @@ import {
   XCircle,
 } from "lucide-react";
 import type { Cluster, ClusterNode, ClusterInfo, DBInfo, ParameterInfo } from "../types/cluster";
-import { fetchCluster, introspectCluster, updateCluster, removeCluster } from "../api/client";
+import { fetchCluster, introspectCluster, updateCluster, removeCluster, toggleNodeMonitoring } from "../api/client";
 
 type Tab = "overview" | "parameters" | "databases" | "settings";
 
@@ -253,7 +253,7 @@ function OverviewTab({ cluster, info }: { cluster: Cluster; info: ClusterInfo })
         <h3 className="text-sm font-medium mb-3" style={{ color: "var(--color-text)" }}>Nodes</h3>
         <div className="space-y-2">
           {cluster.nodes.map((n) => (
-            <NodeRow key={n.id} node={n} />
+            <NodeRow key={n.id} node={n} clusterId={cluster.id} />
           ))}
         </div>
       </div>
@@ -506,13 +506,28 @@ function ParametersTab({ parameters }: { parameters: ParameterInfo[] }) {
   );
 }
 
-function NodeRow({ node }: { node: ClusterNode }) {
+function NodeRow({ node, clusterId, onToggleMonitoring }: { node: ClusterNode; clusterId: string; onToggleMonitoring?: (nodeId: string, enabled: boolean) => void }) {
+  const [toggling, setToggling] = useState(false);
+  const [enabled, setEnabled] = useState(node.monitoring_enabled);
   const roleColors: Record<string, string> = {
     primary: "#22c55e",
     replica: "#3b82f6",
     standby: "#eab308",
   };
   const color = roleColors[node.role] || "var(--color-text-muted)";
+
+  async function handleToggle() {
+    if (!clusterId) return;
+    setToggling(true);
+    try {
+      await toggleNodeMonitoring(clusterId, node.id, !enabled);
+      setEnabled(!enabled);
+      onToggleMonitoring?.(node.id, !enabled);
+    } catch {
+    } finally {
+      setToggling(false);
+    }
+  }
 
   return (
     <div className="flex items-center gap-3 px-3 py-2 rounded-md" style={{ backgroundColor: "var(--color-bg)" }}>
@@ -528,6 +543,21 @@ function NodeRow({ node }: { node: ClusterNode }) {
           {node.dbname}
         </span>
       )}
+      <button
+        onClick={handleToggle}
+        disabled={toggling}
+        className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50"
+        style={{ backgroundColor: enabled ? "var(--color-accent)" : "var(--color-border)" }}
+        title={enabled ? "Monitoring enabled" : "Monitoring disabled"}
+      >
+        <span
+          className="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
+          style={{ transform: enabled ? "translateX(18px)" : "translateX(3px)" }}
+        />
+      </button>
+      <span className="text-[10px]" style={{ color: enabled ? "var(--color-accent)" : "var(--color-text-muted)" }}>
+        {enabled ? "Monitoring" : "Off"}
+      </span>
     </div>
   );
 }
@@ -548,7 +578,7 @@ function SettingsTab({ cluster, onUpdated }: { cluster: Cluster; onUpdated: (c: 
     color: "var(--color-text)",
   };
 
-  function updateNode(index: number, field: keyof ClusterNode, value: string | number) {
+  function updateNode(index: number, field: keyof ClusterNode, value: string | number | boolean) {
     setNodes((prev) => {
       const next = [...prev];
       next[index] = { ...next[index], [field]: value };
@@ -559,7 +589,7 @@ function SettingsTab({ cluster, onUpdated }: { cluster: Cluster; onUpdated: (c: 
   function addNode() {
     setNodes((prev) => [
       ...prev,
-      { id: `node-${prev.length + 1}`, name: "", host: "", port: 5432, role: "replica" as const },
+      { id: `node-${prev.length + 1}`, name: "", host: "", port: 5432, role: "replica" as const, monitoring_enabled: false },
     ]);
   }
 
@@ -694,6 +724,22 @@ function SettingsTab({ cluster, onUpdated }: { cluster: Cluster; onUpdated: (c: 
                 <label className="block text-[10px] mb-0.5" style={{ color: "var(--color-text-muted)" }}>Database</label>
                 <input className="w-full rounded-md border px-2.5 py-1.5 text-sm" style={inputStyle} value={node.dbname || ""} onChange={(e) => updateNode(i, "dbname", e.target.value)} placeholder="postgres" />
               </div>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => updateNode(i, "monitoring_enabled", !node.monitoring_enabled)}
+                className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
+                style={{ backgroundColor: node.monitoring_enabled ? "var(--color-accent)" : "var(--color-border)" }}
+              >
+                <span
+                  className="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
+                  style={{ transform: node.monitoring_enabled ? "translateX(18px)" : "translateX(3px)" }}
+                />
+              </button>
+              <span className="text-xs" style={{ color: node.monitoring_enabled ? "var(--color-accent)" : "var(--color-text-muted)" }}>
+                {node.monitoring_enabled ? "Monitoring enabled" : "Monitoring disabled"}
+              </span>
             </div>
           </div>
         ))}
