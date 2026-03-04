@@ -18,10 +18,14 @@ import (
 	"github.com/jfoltran/pgmanager/internal/db"
 	"github.com/jfoltran/pgmanager/internal/migrationstore"
 	"github.com/jfoltran/pgmanager/internal/monitoring"
+	"github.com/jfoltran/pgmanager/internal/secret"
 	"github.com/jfoltran/pgmanager/internal/server"
 )
 
-var configPath string
+var (
+	configPath string
+	debugMode  bool
+)
 
 var rootCmd = &cobra.Command{
 	Use:   "pgmanager",
@@ -45,6 +49,7 @@ Configuration is loaded from (in order):
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "", "Path to config file")
+	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug logging")
 	rootCmd.AddCommand(migrateCmd)
 }
 
@@ -76,6 +81,9 @@ func run(parentCtx context.Context) error {
 	if err != nil {
 		level = zerolog.InfoLevel
 	}
+	if debugMode {
+		level = zerolog.DebugLevel
+	}
 	logger = logger.Level(level)
 
 	ctx, cancel := context.WithCancel(parentCtx)
@@ -89,7 +97,27 @@ func run(parentCtx context.Context) error {
 	}
 	defer database.Close()
 
-	clusters := cluster.NewStore(database.Pool)
+	var cipher *secret.Box
+	if cfg.Security.EncryptionKey != "" {
+		cipher, err = secret.NewBox(cfg.Security.EncryptionKey)
+		if err != nil {
+			return fmt.Errorf("encryption setup: %w", err)
+		}
+		logger.Info().Msg("password encryption enabled")
+	} else {
+		logger.Warn().Msg("PGMANAGER_ENCRYPTION_KEY not set — node passwords stored in plaintext")
+	}
+
+	clusters := cluster.NewStore(database.Pool, cipher)
+	if cipher != nil {
+		rotated, err := clusters.EncryptExistingPasswords(ctx)
+		if err != nil {
+			return fmt.Errorf("encrypt existing passwords: %w", err)
+		}
+		if rotated > 0 {
+			logger.Info().Int("count", rotated).Msg("encrypted plaintext passwords")
+		}
+	}
 	migrations := migrationstore.NewStore(database.Pool)
 	backups := backup.NewStore(database.Pool)
 	runner := migrationstore.NewRunner(ctx, migrations, clusters, logger)
@@ -97,7 +125,12 @@ func run(parentCtx context.Context) error {
 		logger.Warn().Err(err).Msg("failed to recover stale migrations")
 	}
 
-	mon := monitoring.NewCollector(clusters, logger, monitoring.DefaultTierConfig())
+	monStore := monitoring.NewStore(database.Pool, logger)
+	partMgr := monitoring.NewPartitionManager(database.Pool, logger)
+	monStore.SetPartitionManager(partMgr)
+	partMgr.StartMaintainer(ctx)
+	mon := monitoring.NewCollector(clusters, monStore, logger, monitoring.DefaultTierConfig())
+	mon.SetPartitionManager(partMgr)
 	defer mon.Close()
 	if err := mon.AutoStart(ctx); err != nil {
 		logger.Warn().Err(err).Msg("monitoring auto-start failed")

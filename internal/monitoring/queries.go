@@ -135,6 +135,17 @@ ORDER BY query_start ASC
 LIMIT $2`
 
 // ---------------------------------------------------------------------------
+// Database discovery — list non-template databases on the instance
+// ---------------------------------------------------------------------------
+
+// ListDatabasesQuery returns all non-template databases on the PG instance.
+const ListDatabasesQuery = `
+SELECT datname
+FROM pg_database
+WHERE datistemplate = false AND datallowconn = true
+ORDER BY datname`
+
+// ---------------------------------------------------------------------------
 // Tier 2 — shared memory views, but bounded by LIMIT + schema filter
 // ---------------------------------------------------------------------------
 
@@ -208,6 +219,29 @@ FROM pg_stat_progress_vacuum p
 JOIN pg_class c ON c.oid = p.relid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 ORDER BY p.pid`
+
+// BlockedLocksCountQuery counts sessions blocked by other sessions.
+const BlockedLocksCountQuery = `
+SELECT count(*)
+FROM pg_locks
+WHERE NOT granted
+  AND pid IN (SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend')`
+
+// TxIDAgeQuery returns the transaction ID age percentage.
+// Compares max(age(datfrozenxid)) against autovacuum_freeze_max_age.
+const TxIDAgeQuery = `
+SELECT
+    max(age(datfrozenxid)) AS max_txid_age,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'autovacuum_freeze_max_age') AS freeze_max_age
+FROM pg_database`
+
+// MxIDAgeQuery returns the multi-transaction ID age percentage.
+// Compares max(mxid_age(datminmxid)) against autovacuum_multixact_freeze_max_age.
+const MxIDAgeQuery = `
+SELECT
+    max(mxid_age(datminmxid)) AS max_mxid_age,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'autovacuum_multixact_freeze_max_age') AS mxfreeze_max_age
+FROM pg_database`
 
 // ---------------------------------------------------------------------------
 // Tier 3 — expensive, infrequent or on-demand only

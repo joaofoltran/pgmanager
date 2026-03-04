@@ -8,6 +8,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/jfoltran/pgmanager/internal/idgen"
+	"github.com/jfoltran/pgmanager/internal/secret"
 )
 
 type NodeRole string
@@ -60,12 +63,27 @@ type Cluster struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
-type Store struct {
-	pool *pgxpool.Pool
+const RedactedPassword = "********"
+
+func (c Cluster) Redacted() Cluster {
+	out := c
+	out.Nodes = make([]Node, len(c.Nodes))
+	copy(out.Nodes, c.Nodes)
+	for i := range out.Nodes {
+		if out.Nodes[i].Password != "" {
+			out.Nodes[i].Password = RedactedPassword
+		}
+	}
+	return out
 }
 
-func NewStore(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+type Store struct {
+	pool   *pgxpool.Pool
+	cipher *secret.Box
+}
+
+func NewStore(pool *pgxpool.Pool, cipher *secret.Box) *Store {
+	return &Store{pool: pool, cipher: cipher}
 }
 
 func (s *Store) List(ctx context.Context) ([]Cluster, error) {
@@ -118,10 +136,14 @@ func (s *Store) Get(ctx context.Context, id string) (Cluster, bool, error) {
 	return c, true, nil
 }
 
-func (s *Store) Add(ctx context.Context, c Cluster) error {
+func (s *Store) Add(ctx context.Context, c Cluster) (Cluster, error) {
+	if c.ID == "" {
+		c.ID = idgen.NewClusterID()
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return Cluster{}, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -135,16 +157,26 @@ func (s *Store) Add(ctx context.Context, c Cluster) error {
 		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		c.ID, c.Name, tags, c.BackupPath, now, now)
 	if err != nil {
-		return fmt.Errorf("insert cluster: %w", err)
+		return Cluster{}, fmt.Errorf("insert cluster: %w", err)
 	}
 
-	for _, n := range c.Nodes {
-		if err := insertNode(ctx, tx, c.ID, n); err != nil {
-			return err
+	for i := range c.Nodes {
+		if c.Nodes[i].ID == "" {
+			c.Nodes[i].ID = idgen.NewNodeID()
+		}
+		if err := insertNode(ctx, tx, c.ID, c.Nodes[i], s.cipher); err != nil {
+			return Cluster{}, err
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return Cluster{}, err
+	}
+
+	c.Tags = tags
+	c.CreatedAt = now
+	c.UpdatedAt = now
+	return c, nil
 }
 
 func (s *Store) Update(ctx context.Context, c Cluster) error {
@@ -168,13 +200,28 @@ func (s *Store) Update(ctx context.Context, c Cluster) error {
 		return fmt.Errorf("cluster %q not found", c.ID)
 	}
 
+	oldNodes, err := s.listNodes(ctx, c.ID)
+	if err != nil {
+		return fmt.Errorf("fetch existing nodes: %w", err)
+	}
+	oldPasswords := make(map[string]string, len(oldNodes))
+	for _, n := range oldNodes {
+		oldPasswords[n.ID] = n.Password
+	}
+
 	_, err = tx.Exec(ctx, "DELETE FROM nodes WHERE cluster_id = $1", c.ID)
 	if err != nil {
 		return err
 	}
 
-	for _, n := range c.Nodes {
-		if err := insertNode(ctx, tx, c.ID, n); err != nil {
+	for i := range c.Nodes {
+		if c.Nodes[i].ID == "" {
+			c.Nodes[i].ID = idgen.NewNodeID()
+		}
+		if c.Nodes[i].Password == RedactedPassword {
+			c.Nodes[i].Password = oldPasswords[c.Nodes[i].ID]
+		}
+		if err := insertNode(ctx, tx, c.ID, c.Nodes[i], s.cipher); err != nil {
 			return err
 		}
 	}
@@ -200,7 +247,7 @@ func (s *Store) AddNode(ctx context.Context, clusterID string, n Node) error {
 	}
 	defer tx.Rollback(ctx)
 
-	if err := insertNode(ctx, tx, clusterID, n); err != nil {
+	if err := insertNode(ctx, tx, clusterID, n, s.cipher); err != nil {
 		return err
 	}
 
@@ -253,6 +300,13 @@ func (s *Store) listNodes(ctx context.Context, clusterID string) ([]Node, error)
 			return nil, err
 		}
 		n.User = user
+		if s.cipher != nil && pass != "" {
+			dec, err := s.cipher.Decrypt(pass)
+			if err != nil {
+				return nil, fmt.Errorf("decrypt password for node %s: %w", n.ID, err)
+			}
+			pass = dec
+		}
 		n.Password = pass
 		n.DBName = dbname
 		n.AgentURL = agentURL
@@ -264,12 +318,20 @@ func (s *Store) listNodes(ctx context.Context, clusterID string) ([]Node, error)
 	return nodes, nil
 }
 
-func insertNode(ctx context.Context, tx pgx.Tx, clusterID string, n Node) error {
+func insertNode(ctx context.Context, tx pgx.Tx, clusterID string, n Node, cipher *secret.Box) error {
+	password := n.Password
+	if cipher != nil && password != "" {
+		enc, err := cipher.Encrypt(password)
+		if err != nil {
+			return fmt.Errorf("encrypt password for node %q: %w", n.ID, err)
+		}
+		password = enc
+	}
 	_, err := tx.Exec(ctx,
 		`INSERT INTO nodes (id, cluster_id, name, host, port, role, username, password, dbname, agent_url, monitoring_enabled)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		n.ID, clusterID, n.Name, n.Host, n.Port, string(n.Role),
-		n.User, n.Password, n.DBName, n.AgentURL, n.MonitoringEnabled)
+		n.User, password, n.DBName, n.AgentURL, n.MonitoringEnabled)
 	if err != nil {
 		return fmt.Errorf("insert node %q: %w", n.ID, err)
 	}
@@ -320,26 +382,63 @@ func (s *Store) ListMonitoredClusters(ctx context.Context) ([]Cluster, error) {
 	return clusters, nil
 }
 
+func (s *Store) EncryptExistingPasswords(ctx context.Context) (int, error) {
+	if s.cipher == nil {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT cluster_id, id, password FROM nodes WHERE password != ''")
+	if err != nil {
+		return 0, fmt.Errorf("query nodes: %w", err)
+	}
+	defer rows.Close()
+
+	type row struct {
+		clusterID, nodeID, password string
+	}
+	var plaintext []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.clusterID, &r.nodeID, &r.password); err != nil {
+			return 0, err
+		}
+		if !secret.IsEncrypted(r.password) {
+			plaintext = append(plaintext, r)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, r := range plaintext {
+		enc, err := s.cipher.Encrypt(r.password)
+		if err != nil {
+			return 0, fmt.Errorf("encrypt password for node %s: %w", r.nodeID, err)
+		}
+		_, err = s.pool.Exec(ctx,
+			"UPDATE nodes SET password = $1 WHERE cluster_id = $2 AND id = $3",
+			enc, r.clusterID, r.nodeID)
+		if err != nil {
+			return 0, fmt.Errorf("update node %s: %w", r.nodeID, err)
+		}
+	}
+	return len(plaintext), nil
+}
+
 func ValidateCluster(c Cluster) error {
 	var errs []error
-	if c.ID == "" {
-		errs = append(errs, errors.New("cluster id is required"))
-	}
 	if c.Name == "" {
 		errs = append(errs, errors.New("cluster name is required"))
 	}
 	if len(c.Nodes) == 0 {
 		errs = append(errs, errors.New("at least one node is required"))
 	}
-	for _, n := range c.Nodes {
-		if n.ID == "" {
-			errs = append(errs, errors.New("node id is required"))
-		}
+	for i, n := range c.Nodes {
 		if n.Host == "" {
-			errs = append(errs, errors.New("node host is required"))
+			errs = append(errs, fmt.Errorf("node %d: host is required", i))
 		}
 		if n.Port == 0 {
-			errs = append(errs, fmt.Errorf("node %q port is required", n.ID))
+			errs = append(errs, fmt.Errorf("node %d: port is required", i))
 		}
 	}
 	return errors.Join(errs...)

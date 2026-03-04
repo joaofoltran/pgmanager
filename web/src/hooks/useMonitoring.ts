@@ -1,24 +1,34 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type {
   MonitoringOverview,
   Tier2Snapshot,
 } from "../types/monitoring";
+import type { TimeRange } from "../components/monitoring/TimeRangePicker";
 import {
   fetchMonitoringOverview,
   fetchNodeTableStats,
 } from "../api/client";
 
-export function useMonitoring(clusterId: string | null) {
+export function useMonitoring(
+  clusterId: string | null,
+  timeRange?: TimeRange | null,
+) {
   const [overview, setOverview] = useState<MonitoringOverview | null>(null);
   const [tier2, setTier2] = useState<Record<string, Tier2Snapshot>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const prevRangeRef = useRef<string | null>(null);
 
-  // Tier 1 polling at 2s.
+  const isLive = !timeRange;
+
   const pollOverview = useCallback(async () => {
     if (!clusterId) return;
     try {
-      const data = await fetchMonitoringOverview(clusterId);
+      const data = await fetchMonitoringOverview(
+        clusterId,
+        timeRange?.from,
+        timeRange?.to,
+      );
       setOverview(data);
       setError(null);
     } catch (e) {
@@ -26,7 +36,7 @@ export function useMonitoring(clusterId: string | null) {
     } finally {
       setLoading(false);
     }
-  }, [clusterId]);
+  }, [clusterId, timeRange?.from, timeRange?.to]);
 
   useEffect(() => {
     if (!clusterId) {
@@ -34,15 +44,23 @@ export function useMonitoring(clusterId: string | null) {
       setLoading(false);
       return;
     }
-    setLoading(true);
-    pollOverview();
-    const id = setInterval(pollOverview, 2000);
-    return () => clearInterval(id);
-  }, [clusterId, pollOverview]);
 
-  // Tier 2 polling at 30s for each node.
+    const rangeKey = timeRange ? `${timeRange.from}|${timeRange.to}` : null;
+    if (rangeKey !== prevRangeRef.current) {
+      setLoading(true);
+      prevRangeRef.current = rangeKey;
+    }
+
+    pollOverview();
+
+    if (isLive) {
+      const id = setInterval(pollOverview, 2000);
+      return () => clearInterval(id);
+    }
+  }, [clusterId, pollOverview, isLive, timeRange?.from, timeRange?.to]);
+
   useEffect(() => {
-    if (!overview?.nodes?.length || !clusterId) return;
+    if (!overview?.nodes?.length || !clusterId || !isLive) return;
     const poll = () => {
       for (const n of overview.nodes) {
         fetchNodeTableStats(clusterId, n.node_id)
@@ -55,7 +73,7 @@ export function useMonitoring(clusterId: string | null) {
     poll();
     const id = setInterval(poll, 30000);
     return () => clearInterval(id);
-  }, [clusterId, overview?.nodes?.length]);
+  }, [clusterId, overview?.nodes?.length, isLive]);
 
-  return { overview, tier2, loading, error };
+  return { overview, tier2, loading, error, isLive };
 }

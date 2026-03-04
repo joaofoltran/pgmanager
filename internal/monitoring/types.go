@@ -30,6 +30,7 @@ type ActivitySnapshot struct {
 	IdleInTx         int            `json:"idle_in_transaction"`
 	WaitingOnLock    int            `json:"waiting_on_lock"`
 	MaxConnections   int            `json:"max_connections"`
+	BlockedLocks     int            `json:"blocked_locks"`
 	LongestQuerySec  float64        `json:"longest_query_sec"`
 	LongestQuery     string         `json:"longest_query,omitempty"`
 	LongestQueryPID  int32          `json:"longest_query_pid,omitempty"`
@@ -48,6 +49,8 @@ type DatabaseStats struct {
 	TupFetchedRate  float64 `json:"tup_fetched_rate"`
 	TempFilesRate   float64 `json:"temp_files_rate"`
 	TempBytesRate   float64 `json:"temp_bytes_rate"`
+	TempFilesTotal  int64   `json:"temp_files_total"`
+	TempBytesTotal  int64   `json:"temp_bytes_total"`
 	DeadlocksRate   float64 `json:"deadlocks_rate"`
 	BlkReadRate     float64 `json:"blk_read_rate"`
 	BlkHitRate      float64 `json:"blk_hit_rate"`
@@ -90,6 +93,16 @@ type StandbyInfo struct {
 	ReplayLag       string `json:"replay_lag"`
 }
 
+// DatabaseHealth captures database-level health indicators.
+type DatabaseHealth struct {
+	TxIDAgePct  float64 `json:"txid_age_pct"`  // 0.0–1.0
+	TxIDAge     int64   `json:"txid_age"`
+	TxIDMaxAge  int64   `json:"txid_max_age"`
+	MxIDAgePct  float64 `json:"mxid_age_pct"`  // 0.0–1.0
+	MxIDAge     int64   `json:"mxid_age"`
+	MxIDMaxAge  int64   `json:"mxid_max_age"`
+}
+
 // Tier1Snapshot is the complete Tier 1 snapshot for a single node.
 type Tier1Snapshot struct {
 	Timestamp    time.Time          `json:"timestamp"`
@@ -99,6 +112,7 @@ type Tier1Snapshot struct {
 	Checkpointer CheckpointerStats `json:"checkpointer"`
 	WAL          WALStats           `json:"wal"`
 	Replication  ReplicationInfo    `json:"replication"`
+	Health       DatabaseHealth     `json:"health"`
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +121,7 @@ type Tier1Snapshot struct {
 
 // TableStat captures per-table statistics from pg_stat_user_tables.
 type TableStat struct {
+	Database        string     `json:"database"`
 	Schema          string     `json:"schema"`
 	Name            string     `json:"name"`
 	SeqScan         int64      `json:"seq_scan"`
@@ -127,6 +142,7 @@ type TableStat struct {
 
 // IndexStat captures per-index statistics from pg_stat_user_indexes.
 type IndexStat struct {
+	Database    string `json:"database"`
 	Schema      string `json:"schema"`
 	Table       string `json:"table"`
 	Name        string `json:"name"`
@@ -161,6 +177,7 @@ type VacuumProgress struct {
 type Tier2Snapshot struct {
 	Timestamp       time.Time        `json:"timestamp"`
 	NodeID          string           `json:"node_id"`
+	Databases       []string         `json:"databases,omitempty"`
 	Tables          []TableStat      `json:"tables"`
 	Indexes         []IndexStat      `json:"indexes"`
 	Locks           []LockInfo       `json:"locks"`
@@ -173,6 +190,7 @@ type Tier2Snapshot struct {
 
 // RelationSize captures size breakdown for a relation.
 type RelationSize struct {
+	Database   string `json:"database"`
 	Schema     string `json:"schema"`
 	Name       string `json:"name"`
 	TotalBytes int64  `json:"total_bytes"`
@@ -184,6 +202,7 @@ type RelationSize struct {
 
 // BloatEstimate captures statistics-based bloat estimation.
 type BloatEstimate struct {
+	Database   string  `json:"database"`
 	Schema     string  `json:"schema"`
 	Name       string  `json:"name"`
 	TotalBytes int64   `json:"total_bytes"`
@@ -193,6 +212,7 @@ type BloatEstimate struct {
 
 // TopQuery captures a top query from pg_stat_statements.
 type TopQuery struct {
+	Database       string  `json:"database"`
 	QueryID        int64   `json:"query_id"`
 	Query          string  `json:"query"`
 	Calls          int64   `json:"calls"`
@@ -208,6 +228,7 @@ type TopQuery struct {
 type Tier3Snapshot struct {
 	Timestamp  time.Time       `json:"timestamp"`
 	NodeID     string          `json:"node_id"`
+	Databases  []string        `json:"databases,omitempty"`
 	Sizes      []RelationSize  `json:"sizes,omitempty"`
 	Bloat      []BloatEstimate `json:"bloat,omitempty"`
 	TopQueries []TopQuery      `json:"top_queries,omitempty"`
@@ -251,6 +272,22 @@ type MonitoringOverview struct {
 	ClusterName string                   `json:"cluster_name"`
 	Nodes       []NodeMonitoringSnapshot `json:"nodes"`
 	History     []Tier1Snapshot          `json:"history,omitempty"`
+}
+
+// MonitoringClusterSummary provides a quick overview of a monitored cluster for listing pages.
+type MonitoringClusterSummary struct {
+	ClusterID        string  `json:"cluster_id"`
+	ClusterName      string  `json:"cluster_name"`
+	NodesTotal       int     `json:"nodes_total"`
+	NodesOK          int     `json:"nodes_ok"`
+	TPS              float64 `json:"tps"`
+	ActiveQueries    int     `json:"active_queries"`
+	CacheHitRatio    float64 `json:"cache_hit_ratio"`
+	ReplicationLag   float64 `json:"replication_lag_sec"`
+	TxIDAgePct       float64 `json:"txid_age_pct"`
+	BlockedLocks     int     `json:"blocked_locks"`
+	TotalConnections int     `json:"total_connections"`
+	MaxConnections   int     `json:"max_connections"`
 }
 
 // ---------------------------------------------------------------------------

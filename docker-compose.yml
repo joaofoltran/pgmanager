@@ -7,15 +7,16 @@ services:
       PGMANAGER_LISTEN: "0.0.0.0"
       PGMANAGER_PORT: "7654"
       PGMANAGER_DB_URL: "postgres://pgmanager:pgmanager@db:5432/pgmanager?sslmode=disable"
-      PGMANAGER_LOG_LEVEL: "info"
+      PGMANAGER_LOG_LEVEL: ${PGMANAGER_LOG_LEVEL:-info}
       PGMANAGER_LOG_FORMAT: "console"
+      PGMANAGER_ENCRYPTION_KEY: ${PGMANAGER_ENCRYPTION_KEY:-pgmanager-default-change-me}
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
 
   db:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     ports:
       - "5432:5432"
     environment:

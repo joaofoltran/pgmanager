@@ -133,8 +133,9 @@ func (s *Server) Start(ctx context.Context, listen string, port int) error {
 
 	// Monitoring routes.
 	if s.monitoring != nil && s.clusters != nil {
-		moh := &monitoringHandlers{collector: s.monitoring, clusters: s.clusters}
+		moh := &monitoringHandlers{collector: s.monitoring, clusters: s.clusters, logger: s.logger.With().Str("handler", "monitoring").Logger()}
 		mux.HandleFunc("GET /api/v1/monitoring/status", moh.status)
+		mux.HandleFunc("GET /api/v1/monitoring/clusters", moh.listMonitoredClusters)
 		mux.HandleFunc("POST /api/v1/monitoring/start", moh.startMonitoring)
 		mux.HandleFunc("POST /api/v1/monitoring/stop", moh.stopMonitoring)
 		mux.HandleFunc("POST /api/v1/monitoring/toggle", moh.toggleMonitoring)

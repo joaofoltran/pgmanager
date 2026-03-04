@@ -155,6 +155,11 @@ log "Waiting for databases..."
 wait_for_pg "$SOURCE_DSN" "source-pg" 60
 wait_for_pg "postgres://postgres:dest@localhost:55433/dest" "dest-pg" 60
 
+log "Enabling pg_stat_statements..."
+psql "$SOURCE_DSN" -q -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" >/dev/null 2>&1
+psql "postgres://postgres:dest@localhost:55433/dest" -q -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" >/dev/null 2>&1
+ok "pg_stat_statements enabled on both containers"
+
 # ── Seed function ────────────────────────────────────────────────────────────
 
 seed_table() {
