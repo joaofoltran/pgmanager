@@ -1,6 +1,11 @@
 BINARY := pgmanager
 PKG := ./cmd/pgmanager
 
+# Detect JS package manager: npm → bun
+JS_PM := $(shell command -v npm 2>/dev/null && echo npm || (command -v bun 2>/dev/null && echo bun))
+JS_INSTALL := $(if $(filter npm,$(JS_PM)),npm ci,bun install --frozen-lockfile)
+JS_RUN := $(if $(filter npm,$(JS_PM)),npm run,bun run)
+
 .PHONY: build test test-integration test-benchmark test-stop setup-bench setup-bench-down lint clean web-install web-build web-dev build-full docker install dev dev-db
 
 build:
@@ -54,23 +59,24 @@ clean:
 
 # Frontend targets
 web-install:
-	cd web && npm ci
+	cd web && $(JS_INSTALL)
 
 web-build: web-install
-	cd web && npm run build
+	cd web && $(JS_RUN) build
 	rm -rf internal/server/dist
 	mkdir -p internal/server/dist
 	cp -r web/dist/* internal/server/dist/
 
 web-dev:
-	cd web && npm run dev
+	cd web && $(JS_RUN) dev
 
 # Full build: frontend + Go binary
 build-full: web-build build
 
-# Docker
+# Docker / Podman
+CONTAINER_BUILD := $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
 docker:
-	docker build -t pgmanager .
+	$(CONTAINER_BUILD) build -t pgmanager .
 
 # Install to /usr/local/bin
 install: build-full
