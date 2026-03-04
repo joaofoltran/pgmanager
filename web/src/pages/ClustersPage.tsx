@@ -218,7 +218,6 @@ function AddClusterForm({
   onAdded: (c: Cluster) => void;
   onCancel: () => void;
 }) {
-  const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [host, setHost] = useState("");
   const [port, setPort] = useState("5432");
@@ -235,11 +234,10 @@ function AddClusterForm({
     setError(null);
     try {
       const c = await addCluster({
-        id,
         name,
         nodes: [
           {
-            id: role,
+            id: "",
             name: `${host}-${role}`,
             host,
             port: parseInt(port) || 5432,
@@ -288,24 +286,7 @@ function AddClusterForm({
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label
-            className="block text-xs mb-1"
-            style={{ color: "var(--color-text-secondary)" }}
-          >
-            Cluster ID
-          </label>
-          <input
-            className="w-full rounded-md border px-3 py-2 text-sm"
-            style={inputStyle}
-            placeholder="prod"
-            value={id}
-            onChange={(e) => setId(e.target.value)}
-            required
-          />
-        </div>
-        <div>
+      <div>
           <label
             className="block text-xs mb-1"
             style={{ color: "var(--color-text-secondary)" }}
@@ -321,7 +302,6 @@ function AddClusterForm({
             required
           />
         </div>
-      </div>
 
       <div
         className="border-t pt-3"

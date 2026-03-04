@@ -4,6 +4,7 @@ import type { Migration, CreateMigrationRequest } from "../types/migration";
 import type { Backup } from "../types/backup";
 import type {
   MonitoringOverview,
+  MonitoringClusterSummary,
   Tier2Snapshot,
   Tier3Snapshot,
   SlowQueryEntry,
@@ -79,7 +80,6 @@ export async function fetchCluster(id: string): Promise<Cluster> {
 }
 
 export async function addCluster(cluster: {
-  id: string;
   name: string;
   nodes: Cluster["nodes"];
   tags?: string[];
@@ -255,11 +255,23 @@ export async function removeBackup(id: string): Promise<void> {
 
 // --- Monitoring ---
 
+export async function fetchMonitoredClusters(): Promise<MonitoringClusterSummary[]> {
+  const res = await fetch(`${BASE}/api/v1/monitoring/clusters`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
 export async function fetchMonitoringOverview(
-  clusterId: string
+  clusterId: string,
+  from?: string,
+  to?: string
 ): Promise<MonitoringOverview> {
+  const params = new URLSearchParams();
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  const qs = params.toString();
   const res = await fetch(
-    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}`
+    `${BASE}/api/v1/monitoring/${encodeURIComponent(clusterId)}${qs ? `?${qs}` : ""}`
   );
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();

@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ChevronDown, RefreshCw } from "lucide-react";
+import { useState, useMemo } from "react";
+import { ChevronDown, RefreshCw, Database } from "lucide-react";
 import type { Tier3Snapshot } from "../../types/monitoring";
 import { fetchNodeSizes, refreshNodeSizes } from "../../api/client";
 
@@ -13,6 +13,37 @@ export function SizesSection({ clusterId, nodeId }: Props) {
   const [tier3, setTier3] = useState<Tier3Snapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<"sizes" | "bloat" | "queries">("sizes");
+  const [selectedDB, setSelectedDB] = useState<string | null>(null);
+
+  const databases = useMemo(() => {
+    if (!tier3) return [];
+    if (tier3.databases?.length) return tier3.databases;
+    const dbs = new Set<string>();
+    tier3.sizes?.forEach((s) => s.database && dbs.add(s.database));
+    tier3.bloat?.forEach((b) => b.database && dbs.add(b.database));
+    tier3.top_queries?.forEach((q) => q.database && dbs.add(q.database));
+    return Array.from(dbs).sort();
+  }, [tier3]);
+
+  const activeDB = selectedDB ?? databases[0] ?? null;
+
+  const filteredSizes = useMemo(() => {
+    const sizes = tier3?.sizes ?? [];
+    if (!activeDB || databases.length <= 1) return sizes;
+    return sizes.filter((s) => s.database === activeDB);
+  }, [tier3?.sizes, activeDB, databases.length]);
+
+  const filteredBloat = useMemo(() => {
+    const bloat = tier3?.bloat ?? [];
+    if (!activeDB || databases.length <= 1) return bloat;
+    return bloat.filter((b) => b.database === activeDB);
+  }, [tier3?.bloat, activeDB, databases.length]);
+
+  const filteredQueries = useMemo(() => {
+    const queries = tier3?.top_queries ?? [];
+    if (!activeDB || databases.length <= 1) return queries;
+    return queries.filter((q) => q.database === activeDB);
+  }, [tier3?.top_queries, activeDB, databases.length]);
 
   async function handleRefresh() {
     setLoading(true);
@@ -21,7 +52,6 @@ export function SizesSection({ clusterId, nodeId }: Props) {
       const data = await fetchNodeSizes(clusterId, nodeId);
       setTier3(data);
     } catch {
-      // Silently fail — data might not be ready yet.
     } finally {
       setLoading(false);
     }
@@ -35,7 +65,6 @@ export function SizesSection({ clusterId, nodeId }: Props) {
         const data = await fetchNodeSizes(clusterId, nodeId);
         setTier3(data);
       } catch {
-        // Will show empty state.
       }
     }
   }
@@ -81,20 +110,41 @@ export function SizesSection({ clusterId, nodeId }: Props) {
 
       {expanded && (
         <div className="border-t px-4 pb-4" style={{ borderColor: "var(--color-border)" }}>
-          <div className="flex gap-1 mt-3 mb-3">
-            {(["sizes", "bloat", "queries"] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className="px-3 py-1 rounded text-xs font-medium transition-colors"
-                style={{
-                  backgroundColor: tab === t ? "var(--color-accent)" : "transparent",
-                  color: tab === t ? "#fff" : "var(--color-text-secondary)",
-                }}
-              >
-                {t === "queries" ? "Top Queries" : t.charAt(0).toUpperCase() + t.slice(1)}
-              </button>
-            ))}
+          <div className="flex items-center justify-between mt-3 mb-3">
+            <div className="flex gap-1">
+              {(["sizes", "bloat", "queries"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className="px-3 py-1 rounded text-xs font-medium transition-colors"
+                  style={{
+                    backgroundColor: tab === t ? "var(--color-accent)" : "transparent",
+                    color: tab === t ? "#fff" : "var(--color-text-secondary)",
+                  }}
+                >
+                  {t === "queries" ? "Top Queries" : t.charAt(0).toUpperCase() + t.slice(1)}
+                </button>
+              ))}
+            </div>
+            {databases.length > 1 && (
+              <div className="flex items-center gap-1.5">
+                <Database className="w-3.5 h-3.5" style={{ color: "var(--color-text-muted)" }} />
+                <select
+                  value={activeDB ?? ""}
+                  onChange={(e) => setSelectedDB(e.target.value)}
+                  className="text-xs rounded px-2 py-1 border"
+                  style={{
+                    backgroundColor: "var(--color-bg)",
+                    borderColor: "var(--color-border)",
+                    color: "var(--color-text)",
+                  }}
+                >
+                  {databases.map((db) => (
+                    <option key={db} value={db}>{db}</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           {!tier3 ? (
@@ -103,9 +153,9 @@ export function SizesSection({ clusterId, nodeId }: Props) {
             </div>
           ) : (
             <>
-              {tab === "sizes" && <SizesTab sizes={tier3.sizes ?? []} />}
-              {tab === "bloat" && <BloatTab bloat={tier3.bloat ?? []} />}
-              {tab === "queries" && <QueriesTab queries={tier3.top_queries ?? []} />}
+              {tab === "sizes" && <SizesTab sizes={filteredSizes} />}
+              {tab === "bloat" && <BloatTab bloat={filteredBloat} />}
+              {tab === "queries" && <QueriesTab queries={filteredQueries} />}
             </>
           )}
         </div>

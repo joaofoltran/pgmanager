@@ -6,7 +6,8 @@ import { MigrationsListPage } from "./pages/MigrationsListPage";
 import { CreateMigrationPage } from "./pages/CreateMigrationPage";
 import { MigrationDetailPage } from "./pages/MigrationDetailPage";
 import { BackupPage } from "./pages/BackupPage";
-import { MonitoringPage } from "./pages/MonitoringPage";
+import { MonitoringListPage } from "./pages/MonitoringListPage";
+import { MonitoringDetailPage } from "./pages/MonitoringDetailPage";
 import { StandbyPage } from "./pages/StandbyPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
@@ -22,7 +23,8 @@ export function App() {
           <Route path="/migration/new" element={<CreateMigrationPage />} />
           <Route path="/migration/:id" element={<MigrationDetailPage />} />
           <Route path="/backup" element={<BackupPage />} />
-          <Route path="/monitoring" element={<MonitoringPage />} />
+          <Route path="/monitoring" element={<MonitoringListPage />} />
+          <Route path="/monitoring/:clusterId" element={<MonitoringDetailPage />} />
           <Route path="/standby" element={<StandbyPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>

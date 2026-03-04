@@ -22,10 +22,15 @@ type LoggingConfig struct {
 	Format string `toml:"format"`
 }
 
+type SecurityConfig struct {
+	EncryptionKey string `toml:"encryption_key"`
+}
+
 type Config struct {
 	Server   ServerConfig   `toml:"server"`
 	Database DatabaseConfig `toml:"database"`
 	Logging  LoggingConfig  `toml:"logging"`
+	Security SecurityConfig `toml:"security"`
 }
 
 func Defaults() Config {
@@ -95,5 +100,8 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("PGMANAGER_LOG_FORMAT"); v != "" {
 		cfg.Logging.Format = v
+	}
+	if v := os.Getenv("PGMANAGER_ENCRYPTION_KEY"); v != "" {
+		cfg.Security.EncryptionKey = v
 	}
 }

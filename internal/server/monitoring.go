@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/jfoltran/pgmanager/internal/cluster"
 	"github.com/jfoltran/pgmanager/internal/monitoring"
@@ -12,6 +15,7 @@ import (
 type monitoringHandlers struct {
 	collector *monitoring.Collector
 	clusters  *cluster.Store
+	logger    zerolog.Logger
 }
 
 // GET /api/v1/monitoring/{clusterId}
@@ -21,6 +25,29 @@ func (mh *monitoringHandlers) overview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cluster id required", http.StatusBadRequest)
 		return
 	}
+
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+	if fromStr != "" && toStr != "" {
+		from, err := time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			http.Error(w, "invalid 'from' param: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		to, err := time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			http.Error(w, "invalid 'to' param: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		overview, err := mh.collector.GetOverviewWithRange(r.Context(), clusterID, from, to)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, overview)
+		return
+	}
+
 	overview := mh.collector.GetOverview(clusterID)
 	writeJSON(w, overview)
 }
@@ -101,7 +128,14 @@ func (mh *monitoringHandlers) toggleMonitoring(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	mh.logger.Debug().
+		Str("cluster_id", req.ClusterID).
+		Str("node_id", req.NodeID).
+		Bool("enabled", req.Enabled).
+		Msg("toggle monitoring request")
+
 	if err := mh.clusters.SetNodeMonitoring(r.Context(), req.ClusterID, req.NodeID, req.Enabled); err != nil {
+		mh.logger.Error().Err(err).Str("cluster_id", req.ClusterID).Str("node_id", req.NodeID).Msg("SetNodeMonitoring failed")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -109,14 +143,22 @@ func (mh *monitoringHandlers) toggleMonitoring(w http.ResponseWriter, r *http.Re
 	if req.Enabled {
 		cl, ok, err := mh.clusters.Get(r.Context(), req.ClusterID)
 		if err != nil {
+			mh.logger.Error().Err(err).Str("cluster_id", req.ClusterID).Msg("clusters.Get failed after toggle")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if !ok {
+			mh.logger.Warn().Str("cluster_id", req.ClusterID).Msg("cluster not found after toggle")
 			http.Error(w, "cluster not found", http.StatusNotFound)
 			return
 		}
+		mh.logger.Debug().
+			Str("cluster_id", cl.ID).
+			Str("cluster_name", cl.Name).
+			Int("node_count", len(cl.Nodes)).
+			Msg("starting node monitor")
 		if err := mh.collector.StartNode(context.Background(), cl, req.NodeID); err != nil {
+			mh.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("StartNode failed")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -124,6 +166,10 @@ func (mh *monitoringHandlers) toggleMonitoring(w http.ResponseWriter, r *http.Re
 		mh.collector.StopNode(req.NodeID)
 	}
 
+	mh.logger.Debug().
+		Str("node_id", req.NodeID).
+		Bool("enabled", req.Enabled).
+		Msg("toggle monitoring complete")
 	writeJSON(w, map[string]any{"ok": true, "node_id": req.NodeID, "enabled": req.Enabled})
 }
 
@@ -181,4 +227,13 @@ func (mh *monitoringHandlers) stopMonitoring(w http.ResponseWriter, r *http.Requ
 func (mh *monitoringHandlers) status(w http.ResponseWriter, r *http.Request) {
 	ids := mh.collector.MonitoredClusterIDs()
 	writeJSON(w, map[string]any{"monitored_clusters": ids})
+}
+
+// GET /api/v1/monitoring/clusters
+func (mh *monitoringHandlers) listMonitoredClusters(w http.ResponseWriter, r *http.Request) {
+	summaries := mh.collector.GetClusterSummaries()
+	if summaries == nil {
+		summaries = []monitoring.MonitoringClusterSummary{}
+	}
+	writeJSON(w, summaries)
 }

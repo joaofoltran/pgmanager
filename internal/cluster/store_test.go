@@ -55,11 +55,12 @@ func TestStoreAddAndGet(t *testing.T) {
 		},
 	}
 
-	if err := s.Add(ctx, c); err != nil {
+	created, err := s.Add(ctx, c)
+	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
-	got, ok, err := s.Get(ctx, "prod")
+	got, ok, err := s.Get(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -89,10 +90,10 @@ func TestStoreDuplicateAdd(t *testing.T) {
 		Name:  "Production",
 		Nodes: []Node{{ID: "n1", Host: "h1", Port: 5432}},
 	}
-	if err := s.Add(ctx, c); err != nil {
+	if _, err := s.Add(ctx, c); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if err := s.Add(ctx, c); err == nil {
+	if _, err := s.Add(ctx, c); err == nil {
 		t.Fatal("expected error on duplicate add")
 	}
 }
@@ -110,7 +111,7 @@ func TestStoreList(t *testing.T) {
 	}
 
 	for _, id := range []string{"a", "b", "c"} {
-		s.Add(ctx, Cluster{
+		_, _ = s.Add(ctx, Cluster{
 			ID:    id,
 			Name:  id,
 			Nodes: []Node{{ID: "n", Host: "h", Port: 5432}},
@@ -135,7 +136,7 @@ func TestStoreUpdate(t *testing.T) {
 		Name:  "Production",
 		Nodes: []Node{{ID: "n1", Host: "h1", Port: 5432}},
 	}
-	s.Add(ctx, c)
+	_, _ = s.Add(ctx, c)
 
 	c.Name = "Production (updated)"
 	if err := s.Update(ctx, c); err != nil {
@@ -164,17 +165,17 @@ func TestStoreRemove(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 
-	s.Add(ctx, Cluster{
+	prodC, _ := s.Add(ctx, Cluster{
 		ID:    "prod",
 		Name:  "Production",
 		Nodes: []Node{{ID: "n1", Host: "h1", Port: 5432}},
 	})
 
-	if err := s.Remove(ctx, "prod"); err != nil {
+	if err := s.Remove(ctx, prodC.ID); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 
-	if _, ok, _ := s.Get(ctx, "prod"); ok {
+	if _, ok, _ := s.Get(ctx, prodC.ID); ok {
 		t.Fatal("cluster should be removed")
 	}
 }
@@ -191,7 +192,7 @@ func TestStoreAddNode(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 
-	s.Add(ctx, Cluster{
+	_, _ = s.Add(ctx, Cluster{
 		ID:    "prod",
 		Name:  "Production",
 		Nodes: []Node{{ID: "primary", Host: "h1", Port: 5432, Role: RolePrimary}},
@@ -212,7 +213,7 @@ func TestStoreRemoveNode(t *testing.T) {
 	s := setupTestStore(t)
 	ctx := context.Background()
 
-	s.Add(ctx, Cluster{
+	_, _ = s.Add(ctx, Cluster{
 		ID:   "prod",
 		Name: "Production",
 		Nodes: []Node{
@@ -247,9 +248,9 @@ func TestValidateCluster(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "missing id",
+			name:    "missing id is ok (auto-generated)",
 			cluster: Cluster{Name: "x", Nodes: []Node{{ID: "n", Host: "h", Port: 5432}}},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "missing name",

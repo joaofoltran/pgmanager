@@ -39,7 +39,11 @@ Real-time PostgreSQL monitoring via a tiered polling architecture. Collects metr
 ## Architecture
 
 ```
-MonitoringPage (React)
+MonitoringListPage (React) ──────► GET /api/v1/monitoring/clusters
+  │
+  └── click cluster ──► navigate to /monitoring/{clusterId}
+
+MonitoringDetailPage (React)
   │
   ├── useMonitoring hook ──(HTTP 2s)──► GET /api/v1/monitoring/{clusterId}
   │                        (HTTP 30s)──► GET /api/v1/monitoring/{clusterId}/nodes/{nodeId}/tables
@@ -72,10 +76,11 @@ MonitoringPage (React)
 **Why safe:** These views read from shared memory stats structures (PgBackendStatus, PgStat_StatDBEntry), NOT shared_buffers. Zero cache impact.
 
 **Collects:**
-- `ActivitySnapshot` — connection counts by state, wait events, longest query
-- `DatabaseStats` — cache hit ratio, TPS, tuple rates, temp files, deadlocks (all as **deltas/rates**)
+- `ActivitySnapshot` — connection counts by state, wait events, longest query, blocked locks count
+- `DatabaseStats` — cache hit ratio, TPS, tuple rates, temp files/bytes (rates + totals), deadlocks (all as **deltas/rates**)
 - `CheckpointerStats` — checkpoint rates, buffer write rates (as deltas)
 - `ReplicationInfo` — replica lag (bytes + seconds), standby list for primaries
+- `DatabaseHealth` — txid age %, mxid age % (compared against autovacuum freeze thresholds)
 
 **Ring buffer:** 600 entries (~20 min history)
 
@@ -141,7 +146,9 @@ Cache hit ratio is computed from deltas (current interval), not lifetime average
 - Tier 2: HTTP polling every 30s, only when nodes exist in overview
 - Tier 3: Fetched on-demand when user clicks "Refresh Sizes"
 - History for charts maintained from Tier 1 polling responses (server-side ring buffer)
-- Charts use `recharts` library (LineChart)
+- Charts use `recharts` library (LineChart, AreaChart)
+- Monitoring list page polls `/api/v1/monitoring/clusters` every 5s for live summaries
+- Route: `/monitoring` = cluster listing, `/monitoring/{clusterId}` = detail dashboard
 
 ## REST API
 
@@ -161,10 +168,12 @@ Cache hit ratio is computed from deltas (current interval), not lifetime average
 
 ```
 TierConfig                     — polling intervals per tier
-ActivitySnapshot               — pg_stat_activity aggregation
-DatabaseStats                  — pg_stat_database rates (deltas)
+ActivitySnapshot               — pg_stat_activity aggregation (incl. blocked_locks count)
+DatabaseStats                  — pg_stat_database rates (deltas) + temp_files/bytes totals
 CheckpointerStats              — checkpoint/bgwriter rates (deltas)
+WALStats                       — WAL generation/archiving rates
 ReplicationInfo + StandbyInfo  — replication state
+DatabaseHealth                 — txid age %, mxid age % (vs freeze thresholds)
 Tier1Snapshot                  — composite of above, timestamped
 TableStat                      — per-table pg_stat_user_tables
 IndexStat                      — per-index stats + size
@@ -176,6 +185,7 @@ TopQuery                       — pg_stat_statements top N
 Tier3Snapshot                  — sizes + bloat + top queries
 NodeMonitoringSnapshot         — per-node combined state (status + all tiers)
 MonitoringOverview             — per-cluster API response (nodes[] + history[])
+MonitoringClusterSummary       — per-cluster summary for listing (TPS, cache, lag, health)
 rawDBStats, rawCheckpointerStats — internal, for delta computation
 ```
 
@@ -196,6 +206,9 @@ rawDBStats, rawCheckpointerStats — internal, for delta computation
 | `CheckpointerQueryLegacy` | 1 | `pg_stat_bgwriter` | PG < 17 |
 | `ReplicationLagQuery` | 1 | `pg_is_in_recovery()`, WAL functions | Lag in bytes + seconds |
 | `StandbyInfoQuery` | 1 | `pg_stat_replication` | Connected standbys on primary |
+| `BlockedLocksCountQuery` | 1 | `pg_locks` | Count of sessions blocked by other sessions |
+| `TxIDAgeQuery` | 1 | `pg_database` | max(age(datfrozenxid)) vs autovacuum_freeze_max_age |
+| `MxIDAgeQuery` | 1 | `pg_database` | max(mxid_age(datminmxid)) vs autovacuum_multixact_freeze_max_age |
 | `TableStatsQuery` | 2 | `pg_stat_user_tables` | Schema filter + LIMIT, ordered by scan activity |
 | `IndexStatsQuery` | 2 | `pg_stat_user_indexes` | Includes `pg_relation_size`, ordered ASC (unused first) |
 | `LockContentionQuery` | 2 | `pg_locks` | Self-join for blocked relationships, LIMIT 50 |
@@ -211,6 +224,7 @@ rawDBStats, rawCheckpointerStats — internal, for delta computation
 - `StartCluster(ctx, cluster)` — spawns nodeMonitor goroutines
 - `StopCluster(clusterID)` — cancels contexts, removes from map
 - `GetOverview(clusterID)` — aggregates all node snapshots + history
+- `GetClusterSummaries()` — returns summaries for all monitored clusters (listing page)
 - `GetTier2(nodeID)` / `GetTier3(nodeID)` — per-node accessors
 - `RefreshTier3(ctx, nodeID)` — triggers immediate collection
 - `Close()` — stops everything
@@ -226,22 +240,21 @@ rawDBStats, rawCheckpointerStats — internal, for delta computation
 
 ## Frontend Components
 
-### MonitoringPage (`pages/MonitoringPage.tsx`)
+### MonitoringListPage (`pages/MonitoringListPage.tsx`)
 
-Entry point. Manages:
-- Cluster list fetching + selection dropdown
-- Start/stop monitoring buttons
+Entry point. Lists all monitored clusters with summary metrics:
+- TPS, Cache Hit Ratio, Connections, Replication Lag, Blocked Locks, TXID Age %
+- Warning indicators when metrics exceed thresholds
+- Click navigates to `/monitoring/{clusterId}`
+- Polls every 5s for live updates
+
+### MonitoringDetailPage (`pages/MonitoringDetailPage.tsx`)
+
+Single-cluster dashboard. Manages:
+- Back navigation to cluster listing
 - API-down detection with retry
 - Multi-node status pills (green/red/gray dots)
-- Composes: `OverviewCards` → `ActivitySection` → `PerformanceCharts` → `TableStatsSection` → `SizesSection`
-
-### OverviewCards (`components/monitoring/OverviewCards.tsx`)
-
-4 metric cards from Tier 1 data:
-- **Connections** — active/total of max (red when >80%)
-- **TPS** — commit+rollback rate, rollback/s sub-text
-- **Cache Hit Ratio** — percentage (amber when <95%)
-- **Replication** — lag seconds for replicas, standby count for primaries
+- Composes: `PerformanceCharts` → `ActivitySection` → `SlowQueryLog` → `TableStatsSection` → `SizesSection`
 
 ### ActivitySection (`components/monitoring/ActivitySection.tsx`)
 
@@ -251,9 +264,15 @@ Entry point. Manages:
 
 ### PerformanceCharts (`components/monitoring/PerformanceCharts.tsx`)
 
-4 `recharts` LineCharts from Tier 1 history (last 120 data points):
-- Transactions/sec, Cache Hit Ratio %, Active Queries, Block Reads/sec
-- Shared `ChartCard` helper component
+7-group tabbed chart system from Tier 1 history (last 300 data points):
+- **Overview**: TPS, Cache Hit %, Connection States (stacked area), Longest Query
+- **Sessions**: Connection States, Wait Events (stacked by type), Blocked Locks, Longest Query
+- **Throughput**: Commits/Rollbacks, Tuple Operations, Temp Files/sec, Temp Bytes/sec
+- **I/O & Cache**: Block Reads, Block Hits, Deadlocks, Replication Lag
+- **Health**: TXID Age %, MXID Age %, Replication Lag, Blocked Locks
+- **WAL**: WAL Generated, WAL Records, Full Page Images
+- **Checkpointer**: Checkpoints, Buffers Written
+Shared `ChartCard` and `StackedAreaCard` helper components.
 
 ### TableStatsSection (`components/monitoring/TableStatsSection.tsx`)
 

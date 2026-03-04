@@ -17,7 +17,11 @@ func (ch *clusterHandlers) list(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, clusters)
+	redacted := make([]cluster.Cluster, len(clusters))
+	for i, c := range clusters {
+		redacted[i] = c.Redacted()
+	}
+	writeJSON(w, redacted)
 }
 
 func (ch *clusterHandlers) get(w http.ResponseWriter, r *http.Request) {
@@ -36,11 +40,10 @@ func (ch *clusterHandlers) get(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cluster not found", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, c)
+	writeJSON(w, c.Redacted())
 }
 
 type addClusterRequest struct {
-	ID         string         `json:"id"`
 	Name       string         `json:"name"`
 	Nodes      []cluster.Node `json:"nodes"`
 	Tags       []string       `json:"tags,omitempty"`
@@ -55,7 +58,6 @@ func (ch *clusterHandlers) add(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := cluster.Cluster{
-		ID:         req.ID,
 		Name:       req.Name,
 		Nodes:      req.Nodes,
 		Tags:       req.Tags,
@@ -67,14 +69,14 @@ func (ch *clusterHandlers) add(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ch.store.Add(r.Context(), c); err != nil {
+	created, err := ch.store.Add(r.Context(), c)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
-	got, _, _ := ch.store.Get(r.Context(), c.ID)
 	w.WriteHeader(http.StatusCreated)
-	writeJSON(w, got)
+	writeJSON(w, created.Redacted())
 }
 
 func (ch *clusterHandlers) update(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +111,7 @@ func (ch *clusterHandlers) update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	got, _, _ := ch.store.Get(r.Context(), id)
-	writeJSON(w, got)
+	writeJSON(w, got.Redacted())
 }
 
 func (ch *clusterHandlers) remove(w http.ResponseWriter, r *http.Request) {

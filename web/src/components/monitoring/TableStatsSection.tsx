@@ -1,5 +1,5 @@
-import { ChevronDown, AlertTriangle } from "lucide-react";
-import { useState } from "react";
+import { ChevronDown, AlertTriangle, Database } from "lucide-react";
+import { useState, useMemo } from "react";
 import type { Tier2Snapshot } from "../../types/monitoring";
 
 interface Props {
@@ -9,13 +9,37 @@ interface Props {
 export function TableStatsSection({ tier2 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [tab, setTab] = useState<"tables" | "indexes" | "locks" | "vacuum">("tables");
+  const [selectedDB, setSelectedDB] = useState<string | null>(null);
+
+  const databases = useMemo(() => {
+    if (!tier2) return [];
+    if (tier2.databases?.length) return tier2.databases;
+    const dbs = new Set<string>();
+    tier2.tables?.forEach((t) => t.database && dbs.add(t.database));
+    tier2.indexes?.forEach((i) => i.database && dbs.add(i.database));
+    return Array.from(dbs).sort();
+  }, [tier2]);
+
+  const activeDB = selectedDB ?? databases[0] ?? null;
+
+  const filteredTables = useMemo(() => {
+    const tables = tier2?.tables ?? [];
+    if (!activeDB || databases.length <= 1) return tables;
+    return tables.filter((t) => t.database === activeDB);
+  }, [tier2?.tables, activeDB, databases.length]);
+
+  const filteredIndexes = useMemo(() => {
+    const indexes = tier2?.indexes ?? [];
+    if (!activeDB || databases.length <= 1) return indexes;
+    return indexes.filter((i) => i.database === activeDB);
+  }, [tier2?.indexes, activeDB, databases.length]);
 
   if (!tier2) return null;
 
   const vacuums = tier2.vacuum_progress ?? [];
 
-  const unusedIndexes = (tier2.indexes ?? []).filter((i) => i.idx_scan === 0);
-  const deadTupTables = (tier2.tables ?? []).filter(
+  const unusedIndexes = filteredIndexes.filter((i) => i.idx_scan === 0);
+  const deadTupTables = filteredTables.filter(
     (t) => t.n_dead_tup > 1000 && t.n_live_tup > 0 && t.n_dead_tup / t.n_live_tup > 0.1
   );
 
@@ -39,7 +63,7 @@ export function TableStatsSection({ tier2 }: Props) {
           Table & Index Stats
         </span>
         <span className="text-xs ml-auto" style={{ color: "var(--color-text-muted)" }}>
-          {tier2.tables?.length ?? 0} tables &middot; {tier2.indexes?.length ?? 0} indexes
+          {filteredTables.length} tables &middot; {filteredIndexes.length} indexes
           {tier2.locks?.length ? ` · ${tier2.locks.length} blocked` : ""}
         </span>
         {(unusedIndexes.length > 0 || deadTupTables.length > 0) && (
@@ -49,26 +73,47 @@ export function TableStatsSection({ tier2 }: Props) {
 
       {expanded && (
         <div className="border-t px-4 pb-4" style={{ borderColor: "var(--color-border)" }}>
-          <div className="flex gap-1 mt-3 mb-3">
-            {(["tables", "indexes", "locks", "vacuum"] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className="px-3 py-1 rounded text-xs font-medium transition-colors"
-                style={{
-                  backgroundColor: tab === t ? "var(--color-accent)" : "transparent",
-                  color: tab === t ? "#fff" : "var(--color-text-secondary)",
-                }}
-              >
-                {t.charAt(0).toUpperCase() + t.slice(1)}
-                {t === "locks" && tier2.locks?.length ? ` (${tier2.locks.length})` : ""}
-                {t === "vacuum" && vacuums.length ? ` (${vacuums.length})` : ""}
-              </button>
-            ))}
+          <div className="flex items-center justify-between mt-3 mb-3">
+            <div className="flex gap-1">
+              {(["tables", "indexes", "locks", "vacuum"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className="px-3 py-1 rounded text-xs font-medium transition-colors"
+                  style={{
+                    backgroundColor: tab === t ? "var(--color-accent)" : "transparent",
+                    color: tab === t ? "#fff" : "var(--color-text-secondary)",
+                  }}
+                >
+                  {t.charAt(0).toUpperCase() + t.slice(1)}
+                  {t === "locks" && tier2.locks?.length ? ` (${tier2.locks.length})` : ""}
+                  {t === "vacuum" && vacuums.length ? ` (${vacuums.length})` : ""}
+                </button>
+              ))}
+            </div>
+            {databases.length > 1 && (
+              <div className="flex items-center gap-1.5">
+                <Database className="w-3.5 h-3.5" style={{ color: "var(--color-text-muted)" }} />
+                <select
+                  value={activeDB ?? ""}
+                  onChange={(e) => setSelectedDB(e.target.value)}
+                  className="text-xs rounded px-2 py-1 border"
+                  style={{
+                    backgroundColor: "var(--color-bg)",
+                    borderColor: "var(--color-border)",
+                    color: "var(--color-text)",
+                  }}
+                >
+                  {databases.map((db) => (
+                    <option key={db} value={db}>{db}</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
-          {tab === "tables" && <TablesTab tables={tier2.tables ?? []} />}
-          {tab === "indexes" && <IndexesTab indexes={tier2.indexes ?? []} />}
+          {tab === "tables" && <TablesTab tables={filteredTables} showDB={databases.length > 1} />}
+          {tab === "indexes" && <IndexesTab indexes={filteredIndexes} showDB={databases.length > 1} />}
           {tab === "locks" && <LocksTab locks={tier2.locks ?? []} />}
           {tab === "vacuum" && <VacuumTab vacuums={vacuums} />}
         </div>
@@ -77,7 +122,7 @@ export function TableStatsSection({ tier2 }: Props) {
   );
 }
 
-function TablesTab({ tables }: { tables: Props["tier2"] extends null ? never : NonNullable<Props["tier2"]>["tables"] }) {
+function TablesTab({ tables, showDB }: { tables: Props["tier2"] extends null ? never : NonNullable<Props["tier2"]>["tables"]; showDB: boolean }) {
   if (tables.length === 0) {
     return <EmptyState text="No table stats collected yet" />;
   }
@@ -86,6 +131,7 @@ function TablesTab({ tables }: { tables: Props["tier2"] extends null ? never : N
       <table className="w-full text-xs">
         <thead>
           <tr style={{ color: "var(--color-text-muted)" }}>
+            {showDB && <th className="text-left py-1.5 px-2 font-medium">DB</th>}
             <th className="text-left py-1.5 px-2 font-medium">Table</th>
             <th className="text-right py-1.5 px-2 font-medium">Seq Scans</th>
             <th className="text-right py-1.5 px-2 font-medium">Idx Usage</th>
@@ -97,10 +143,15 @@ function TablesTab({ tables }: { tables: Props["tier2"] extends null ? never : N
         <tbody>
           {tables.map((t) => (
             <tr
-              key={`${t.schema}.${t.name}`}
+              key={`${t.database}.${t.schema}.${t.name}`}
               className="border-t"
               style={{ borderColor: "var(--color-border)" }}
             >
+              {showDB && (
+                <td className="py-1.5 px-2 font-mono" style={{ color: "var(--color-text-muted)" }}>
+                  {t.database}
+                </td>
+              )}
               <td className="py-1.5 px-2 font-mono" style={{ color: "var(--color-text)" }}>
                 {t.schema}.{t.name}
               </td>
@@ -137,7 +188,7 @@ function TablesTab({ tables }: { tables: Props["tier2"] extends null ? never : N
   );
 }
 
-function IndexesTab({ indexes }: { indexes: NonNullable<NonNullable<Props["tier2"]>>["indexes"] }) {
+function IndexesTab({ indexes, showDB }: { indexes: NonNullable<NonNullable<Props["tier2"]>>["indexes"]; showDB: boolean }) {
   if (indexes.length === 0) {
     return <EmptyState text="No index stats collected yet" />;
   }
@@ -146,6 +197,7 @@ function IndexesTab({ indexes }: { indexes: NonNullable<NonNullable<Props["tier2
       <table className="w-full text-xs">
         <thead>
           <tr style={{ color: "var(--color-text-muted)" }}>
+            {showDB && <th className="text-left py-1.5 px-2 font-medium">DB</th>}
             <th className="text-left py-1.5 px-2 font-medium">Index</th>
             <th className="text-left py-1.5 px-2 font-medium">Table</th>
             <th className="text-right py-1.5 px-2 font-medium">Scans</th>
@@ -155,10 +207,15 @@ function IndexesTab({ indexes }: { indexes: NonNullable<NonNullable<Props["tier2
         <tbody>
           {indexes.map((i) => (
             <tr
-              key={`${i.schema}.${i.name}`}
+              key={`${i.database}.${i.schema}.${i.name}`}
               className="border-t"
               style={{ borderColor: "var(--color-border)" }}
             >
+              {showDB && (
+                <td className="py-1.5 px-2 font-mono" style={{ color: "var(--color-text-muted)" }}>
+                  {i.database}
+                </td>
+              )}
               <td className="py-1.5 px-2 font-mono" style={{
                 color: i.idx_scan === 0 ? "#f59e0b" : "var(--color-text)",
               }}>

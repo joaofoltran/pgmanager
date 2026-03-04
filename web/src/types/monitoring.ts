@@ -9,6 +9,7 @@ export interface ActivitySnapshot {
   idle_in_transaction: number;
   waiting_on_lock: number;
   max_connections: number;
+  blocked_locks: number;
   longest_query_sec: number;
   longest_query?: string;
   longest_query_pid?: number;
@@ -26,6 +27,8 @@ export interface DatabaseStats {
   tup_fetched_rate: number;
   temp_files_rate: number;
   temp_bytes_rate: number;
+  temp_files_total: number;
+  temp_bytes_total: number;
   deadlocks_rate: number;
   blk_read_rate: number;
   blk_hit_rate: number;
@@ -64,6 +67,15 @@ export interface ReplicationInfo {
   standbys?: StandbyInfo[];
 }
 
+export interface DatabaseHealth {
+  txid_age_pct: number;
+  txid_age: number;
+  txid_max_age: number;
+  mxid_age_pct: number;
+  mxid_age: number;
+  mxid_max_age: number;
+}
+
 export interface Tier1Snapshot {
   timestamp: string;
   node_id: string;
@@ -72,6 +84,7 @@ export interface Tier1Snapshot {
   checkpointer: CheckpointerStats;
   wal: WALStats;
   replication: ReplicationInfo;
+  health: DatabaseHealth;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +92,7 @@ export interface Tier1Snapshot {
 // ---------------------------------------------------------------------------
 
 export interface TableStat {
+  database: string;
   schema: string;
   name: string;
   seq_scan: number;
@@ -98,6 +112,7 @@ export interface TableStat {
 }
 
 export interface IndexStat {
+  database: string;
   schema: string;
   table: string;
   name: string;
@@ -129,6 +144,7 @@ export interface VacuumProgress {
 export interface Tier2Snapshot {
   timestamp: string;
   node_id: string;
+  databases?: string[];
   tables: TableStat[];
   indexes: IndexStat[];
   locks: LockInfo[];
@@ -140,6 +156,7 @@ export interface Tier2Snapshot {
 // ---------------------------------------------------------------------------
 
 export interface RelationSize {
+  database: string;
   schema: string;
   name: string;
   total_bytes: number;
@@ -150,6 +167,7 @@ export interface RelationSize {
 }
 
 export interface BloatEstimate {
+  database: string;
   schema: string;
   name: string;
   total_bytes: number;
@@ -158,6 +176,7 @@ export interface BloatEstimate {
 }
 
 export interface TopQuery {
+  database: string;
   query_id: number;
   query: string;
   calls: number;
@@ -172,6 +191,7 @@ export interface TopQuery {
 export interface Tier3Snapshot {
   timestamp: string;
   node_id: string;
+  databases?: string[];
   sizes?: RelationSize[];
   bloat?: BloatEstimate[];
   top_queries?: TopQuery[];
@@ -214,4 +234,19 @@ export interface MonitoringOverview {
   cluster_name: string;
   nodes: NodeMonitoringSnapshot[];
   history?: Tier1Snapshot[];
+}
+
+export interface MonitoringClusterSummary {
+  cluster_id: string;
+  cluster_name: string;
+  nodes_total: number;
+  nodes_ok: number;
+  tps: number;
+  active_queries: number;
+  cache_hit_ratio: number;
+  replication_lag_sec: number;
+  txid_age_pct: number;
+  blocked_locks: number;
+  total_connections: number;
+  max_connections: number;
 }

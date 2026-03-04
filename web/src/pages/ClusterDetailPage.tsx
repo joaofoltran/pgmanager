@@ -589,7 +589,7 @@ function SettingsTab({ cluster, onUpdated }: { cluster: Cluster; onUpdated: (c: 
   function addNode() {
     setNodes((prev) => [
       ...prev,
-      { id: `node-${prev.length + 1}`, name: "", host: "", port: 5432, role: "replica" as const, monitoring_enabled: false },
+      { id: "", name: "", host: "", port: 5432, role: "replica" as const, monitoring_enabled: false },
     ]);
   }
 

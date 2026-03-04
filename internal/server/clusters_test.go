@@ -46,7 +46,7 @@ func setupClusterTest(t *testing.T) *clusterHandlers {
 		agent_url TEXT NOT NULL DEFAULT '', PRIMARY KEY (cluster_id, id)
 	)`)
 
-	store := cluster.NewStore(pool)
+	store := cluster.NewStore(pool, nil)
 	return &clusterHandlers{store: store}
 }
 

@@ -24,6 +24,7 @@ type nodeMonitor struct {
 	clusterName string
 	node        cluster.Node
 	cfg         TierConfig
+	store       *Store
 	logger      zerolog.Logger
 
 	mu     sync.RWMutex
@@ -31,6 +32,9 @@ type nodeMonitor struct {
 	status string // "connecting", "ok", "error", "disconnected"
 	lastErr string
 	pgVersion int // e.g. 170000 for PG17
+
+	// Discovered databases on this instance.
+	databases []string
 
 	// Latest snapshots.
 	tier1 *Tier1Snapshot
@@ -57,12 +61,13 @@ type nodeMonitor struct {
 	cancel context.CancelFunc
 }
 
-func newNodeMonitor(clusterID, clusterName string, node cluster.Node, cfg TierConfig, logger zerolog.Logger) *nodeMonitor {
+func newNodeMonitor(clusterID, clusterName string, node cluster.Node, cfg TierConfig, store *Store, logger zerolog.Logger) *nodeMonitor {
 	return &nodeMonitor{
 		clusterID:    clusterID,
 		clusterName:  clusterName,
 		node:         node,
 		cfg:          cfg,
+		store:        store,
 		logger:       logger.With().Str("node", node.ID).Str("host", node.Host).Logger(),
 		status:       "connecting",
 		tier1Ring:    make([]Tier1Snapshot, 0, tier1RingCap),
@@ -148,6 +153,9 @@ func (nm *nodeMonitor) runTickers(ctx context.Context) {
 	defer t1.Stop()
 	defer t2.Stop()
 
+	// Discover databases before first Tier2/Tier3 collection.
+	nm.discoverDatabases(ctx)
+
 	// Collect immediately on start.
 	nm.collectTier1(ctx)
 	nm.collectTier2(ctx)
@@ -172,9 +180,9 @@ func (nm *nodeMonitor) runTickers(ctx context.Context) {
 				return
 			}
 		case <-t2.C:
+			nm.discoverDatabases(ctx)
 			if err := nm.collectTier2(ctx); err != nil {
 				nm.logger.Warn().Err(err).Msg("tier2 collection failed")
-				// Tier 2 failure is not fatal — keep going.
 			}
 		case <-t3:
 			if err := nm.collectTier3(ctx); err != nil {
@@ -197,6 +205,67 @@ func (nm *nodeMonitor) stop() {
 	if nm.cancel != nil {
 		nm.cancel()
 	}
+}
+
+// discoverDatabases queries pg_database to find all non-template databases.
+func (nm *nodeMonitor) discoverDatabases(ctx context.Context) {
+	nm.mu.RLock()
+	conn := nm.conn
+	nm.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+
+	rows, err := conn.Query(ctx, ListDatabasesQuery)
+	if err != nil {
+		nm.logger.Debug().Err(err).Msg("database discovery failed")
+		return
+	}
+	defer rows.Close()
+
+	var dbs []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			break
+		}
+		dbs = append(dbs, name)
+	}
+	if len(dbs) == 0 {
+		return
+	}
+
+	nm.mu.Lock()
+	nm.databases = dbs
+	nm.mu.Unlock()
+	nm.logger.Debug().Strs("databases", dbs).Msg("discovered databases")
+}
+
+// connectToDB opens a short-lived connection to a specific database on the same instance.
+func (nm *nodeMonitor) connectToDB(ctx context.Context, dbname string) (*pgx.Conn, error) {
+	dsn := nm.node.DSN()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse dsn: %w", err)
+	}
+	cfg.Database = dbname
+	cfg.RuntimeParams["application_name"] = "pgmanager_monitoring"
+	cfg.RuntimeParams["statement_timeout"] = "10000"
+
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect to %s: %w", dbname, err)
+	}
+	return conn, nil
+}
+
+// connDBName returns the database name the main connection is connected to.
+func (nm *nodeMonitor) connDBName() string {
+	dbname := nm.node.DBName
+	if dbname == "" {
+		dbname = "postgres"
+	}
+	return dbname
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +337,10 @@ func (nm *nodeMonitor) collectTier1(ctx context.Context) error {
 
 	// Longest query detail.
 	_ = conn.QueryRow(ctx, LongestQueryQuery).Scan(&a.LongestQueryPID, &a.LongestQuery)
+
+	// Blocked locks count.
+	_ = conn.QueryRow(ctx, BlockedLocksCountQuery).Scan(&a.BlockedLocks)
+
 	snap.Activity = a
 
 	// Database stats (delta computation).
@@ -283,7 +356,10 @@ func (nm *nodeMonitor) collectTier1(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("database stats: %w", err)
 	}
-	snap.Database = nm.computeDBDeltas(raw)
+	dbStats := nm.computeDBDeltas(raw)
+	dbStats.TempFilesTotal = raw.TempFiles
+	dbStats.TempBytesTotal = raw.TempBytes
+	snap.Database = dbStats
 
 	// Checkpointer stats (delta).
 	var rawCk rawCheckpointerStats
@@ -346,14 +422,38 @@ func (nm *nodeMonitor) collectTier1(ctx context.Context) error {
 	}
 	snap.Replication = repl
 
+	// Database health: Transaction ID age.
+	var health DatabaseHealth
+	var txidAge, txidMaxAge int64
+	if err := conn.QueryRow(ctx, TxIDAgeQuery).Scan(&txidAge, &txidMaxAge); err == nil && txidMaxAge > 0 {
+		health.TxIDAge = txidAge
+		health.TxIDMaxAge = txidMaxAge
+		health.TxIDAgePct = float64(txidAge) / float64(txidMaxAge)
+	}
+
+	// Database health: Multi-transaction ID age.
+	var mxidAge, mxidMaxAge int64
+	if err := conn.QueryRow(ctx, MxIDAgeQuery).Scan(&mxidAge, &mxidMaxAge); err == nil && mxidMaxAge > 0 {
+		health.MxIDAge = mxidAge
+		health.MxIDMaxAge = mxidMaxAge
+		health.MxIDAgePct = float64(mxidAge) / float64(mxidMaxAge)
+	}
+	snap.Health = health
+
 	// Collect slow queries (>5 seconds) into log.
 	nm.collectSlowQueries(ctx, conn)
 
-	// Store.
+	// Store in memory ring buffer.
 	nm.mu.Lock()
 	nm.tier1 = &snap
 	nm.tier1Ring = appendRing(nm.tier1Ring, snap, tier1RingCap)
 	nm.mu.Unlock()
+
+	// Persist to DB asynchronously.
+	if nm.store != nil {
+		go nm.store.Insert(context.Background(), snap, nm.clusterID)
+	}
+
 	return nil
 }
 
@@ -500,6 +600,7 @@ func (nm *nodeMonitor) computeWALDeltas(raw rawWALStats) WALStats {
 func (nm *nodeMonitor) collectTier2(ctx context.Context) error {
 	nm.mu.RLock()
 	conn := nm.conn
+	dbs := nm.databases
 	nm.mu.RUnlock()
 	if conn == nil {
 		return fmt.Errorf("no connection")
@@ -508,60 +609,40 @@ func (nm *nodeMonitor) collectTier2(ctx context.Context) error {
 	snap := Tier2Snapshot{
 		Timestamp: time.Now(),
 		NodeID:    nm.node.ID,
+		Databases: dbs,
 	}
 
-	// Tables.
-	rows, err := conn.Query(ctx, TableStatsQuery, nil, 100)
-	if err != nil {
-		return fmt.Errorf("table stats: %w", err)
-	}
-	for rows.Next() {
-		var t TableStat
-		if err := rows.Scan(
-			&t.Schema, &t.Name,
-			&t.SeqScan, &t.SeqTupRead, &t.IdxScan, &t.IdxTupFetch,
-			&t.NTupIns, &t.NTupUpd, &t.NTupDel,
-			&t.NLiveTup, &t.NDeadTup,
-			&t.LastVacuum, &t.LastAutoVacuum, &t.LastAnalyze, &t.LastAutoAnalyze,
-		); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan table stat: %w", err)
-		}
-		total := t.SeqScan + t.IdxScan
-		if total > 0 {
-			t.IndexUsageRatio = float64(t.IdxScan) / float64(total)
-		}
-		snap.Tables = append(snap.Tables, t)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+	mainDB := nm.connDBName()
+
+	// Collect per-database stats (tables + indexes).
+	dbsToQuery := dbs
+	if len(dbsToQuery) == 0 {
+		dbsToQuery = []string{mainDB}
 	}
 
-	// Indexes.
-	rows, err = conn.Query(ctx, IndexStatsQuery, nil, 50)
-	if err != nil {
-		return fmt.Errorf("index stats: %w", err)
-	}
-	for rows.Next() {
-		var idx IndexStat
-		if err := rows.Scan(
-			&idx.Schema, &idx.Table, &idx.Name,
-			&idx.IdxScan, &idx.IdxTupRead, &idx.IdxTupFetch,
-			&idx.SizeBytes, &idx.Size,
-		); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan index stat: %w", err)
+	for _, db := range dbsToQuery {
+		var c *pgx.Conn
+		if db == mainDB {
+			c = conn
+		} else {
+			var err error
+			c, err = nm.connectToDB(ctx, db)
+			if err != nil {
+				nm.logger.Debug().Err(err).Str("database", db).Msg("skipping database for tier2")
+				continue
+			}
 		}
-		snap.Indexes = append(snap.Indexes, idx)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+
+		nm.collectTier2Tables(ctx, c, db, &snap)
+		nm.collectTier2Indexes(ctx, c, db, &snap)
+
+		if db != mainDB {
+			c.Close(ctx)
+		}
 	}
 
-	// Lock contention.
-	rows, err = conn.Query(ctx, LockContentionQuery)
+	// Lock contention (instance-wide, from main conn).
+	rows, err := conn.Query(ctx, LockContentionQuery)
 	if err != nil {
 		return fmt.Errorf("lock contention: %w", err)
 	}
@@ -578,7 +659,7 @@ func (nm *nodeMonitor) collectTier2(ctx context.Context) error {
 		return err
 	}
 
-	// Vacuum progress.
+	// Vacuum progress (instance-wide, from main conn).
 	rows, err = conn.Query(ctx, VacuumProgressQuery)
 	if err != nil {
 		nm.logger.Debug().Err(err).Msg("vacuum progress query failed")
@@ -604,6 +685,58 @@ func (nm *nodeMonitor) collectTier2(ctx context.Context) error {
 	return nil
 }
 
+func (nm *nodeMonitor) collectTier2Tables(ctx context.Context, conn *pgx.Conn, dbname string, snap *Tier2Snapshot) {
+	rows, err := conn.Query(ctx, TableStatsQuery, nil, 100)
+	if err != nil {
+		nm.logger.Debug().Err(err).Str("database", dbname).Msg("table stats query failed")
+		return
+	}
+	for rows.Next() {
+		var t TableStat
+		if err := rows.Scan(
+			&t.Schema, &t.Name,
+			&t.SeqScan, &t.SeqTupRead, &t.IdxScan, &t.IdxTupFetch,
+			&t.NTupIns, &t.NTupUpd, &t.NTupDel,
+			&t.NLiveTup, &t.NDeadTup,
+			&t.LastVacuum, &t.LastAutoVacuum, &t.LastAnalyze, &t.LastAutoAnalyze,
+		); err != nil {
+			rows.Close()
+			nm.logger.Debug().Err(err).Str("database", dbname).Msg("scan table stat failed")
+			return
+		}
+		t.Database = dbname
+		total := t.SeqScan + t.IdxScan
+		if total > 0 {
+			t.IndexUsageRatio = float64(t.IdxScan) / float64(total)
+		}
+		snap.Tables = append(snap.Tables, t)
+	}
+	rows.Close()
+}
+
+func (nm *nodeMonitor) collectTier2Indexes(ctx context.Context, conn *pgx.Conn, dbname string, snap *Tier2Snapshot) {
+	rows, err := conn.Query(ctx, IndexStatsQuery, nil, 50)
+	if err != nil {
+		nm.logger.Debug().Err(err).Str("database", dbname).Msg("index stats query failed")
+		return
+	}
+	for rows.Next() {
+		var idx IndexStat
+		if err := rows.Scan(
+			&idx.Schema, &idx.Table, &idx.Name,
+			&idx.IdxScan, &idx.IdxTupRead, &idx.IdxTupFetch,
+			&idx.SizeBytes, &idx.Size,
+		); err != nil {
+			rows.Close()
+			nm.logger.Debug().Err(err).Str("database", dbname).Msg("scan index stat failed")
+			return
+		}
+		idx.Database = dbname
+		snap.Indexes = append(snap.Indexes, idx)
+	}
+	rows.Close()
+}
+
 // ---------------------------------------------------------------------------
 // Tier 3 collection
 // ---------------------------------------------------------------------------
@@ -611,6 +744,7 @@ func (nm *nodeMonitor) collectTier2(ctx context.Context) error {
 func (nm *nodeMonitor) collectTier3(ctx context.Context) error {
 	nm.mu.RLock()
 	conn := nm.conn
+	dbs := nm.databases
 	nm.mu.RUnlock()
 	if conn == nil {
 		return fmt.Errorf("no connection")
@@ -619,12 +753,50 @@ func (nm *nodeMonitor) collectTier3(ctx context.Context) error {
 	snap := Tier3Snapshot{
 		Timestamp: time.Now(),
 		NodeID:    nm.node.ID,
+		Databases: dbs,
 	}
 
-	// Relation sizes.
+	mainDB := nm.connDBName()
+
+	dbsToQuery := dbs
+	if len(dbsToQuery) == 0 {
+		dbsToQuery = []string{mainDB}
+	}
+
+	for _, db := range dbsToQuery {
+		var c *pgx.Conn
+		if db == mainDB {
+			c = conn
+		} else {
+			var err error
+			c, err = nm.connectToDB(ctx, db)
+			if err != nil {
+				nm.logger.Debug().Err(err).Str("database", db).Msg("skipping database for tier3")
+				continue
+			}
+		}
+
+		nm.collectTier3Sizes(ctx, c, db, &snap)
+		nm.collectTier3Bloat(ctx, c, db, &snap)
+		nm.collectTier3TopQueries(ctx, c, db, &snap)
+
+		if db != mainDB {
+			c.Close(ctx)
+		}
+	}
+
+	nm.mu.Lock()
+	nm.tier3 = &snap
+	nm.tier3Ring = appendRing(nm.tier3Ring, snap, tier3RingCap)
+	nm.mu.Unlock()
+	return nil
+}
+
+func (nm *nodeMonitor) collectTier3Sizes(ctx context.Context, conn *pgx.Conn, dbname string, snap *Tier3Snapshot) {
 	rows, err := conn.Query(ctx, RelationSizesQuery, nil, 50)
 	if err != nil {
-		return fmt.Errorf("relation sizes: %w", err)
+		nm.logger.Debug().Err(err).Str("database", dbname).Msg("relation sizes query failed")
+		return
 	}
 	for rows.Next() {
 		var s RelationSize
@@ -634,63 +806,59 @@ func (nm *nodeMonitor) collectTier3(ctx context.Context) error {
 			&s.DataBytes, &s.IndexBytes, &s.ToastBytes,
 		); err != nil {
 			rows.Close()
-			return fmt.Errorf("scan size: %w", err)
+			return
 		}
+		s.Database = dbname
 		snap.Sizes = append(snap.Sizes, s)
 	}
 	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
+}
 
-	// Bloat estimates.
-	rows, err = conn.Query(ctx, BloatEstimateQuery, nil, 50)
+func (nm *nodeMonitor) collectTier3Bloat(ctx context.Context, conn *pgx.Conn, dbname string, snap *Tier3Snapshot) {
+	rows, err := conn.Query(ctx, BloatEstimateQuery, nil, 50)
 	if err != nil {
-		nm.logger.Debug().Err(err).Msg("bloat estimation skipped")
-	} else {
-		for rows.Next() {
-			var b BloatEstimate
-			if err := rows.Scan(&b.Schema, &b.Name, &b.TotalBytes, &b.BloatBytes); err != nil {
-				rows.Close()
-				break
-			}
-			if b.TotalBytes > 0 {
-				b.BloatRatio = float64(b.BloatBytes) / float64(b.TotalBytes)
-			}
-			snap.Bloat = append(snap.Bloat, b)
-		}
-		rows.Close()
+		nm.logger.Debug().Err(err).Str("database", dbname).Msg("bloat estimation skipped")
+		return
 	}
+	for rows.Next() {
+		var b BloatEstimate
+		if err := rows.Scan(&b.Schema, &b.Name, &b.TotalBytes, &b.BloatBytes); err != nil {
+			rows.Close()
+			return
+		}
+		b.Database = dbname
+		if b.TotalBytes > 0 {
+			b.BloatRatio = float64(b.BloatBytes) / float64(b.TotalBytes)
+		}
+		snap.Bloat = append(snap.Bloat, b)
+	}
+	rows.Close()
+}
 
-	// Top queries (pg_stat_statements may not be installed).
-	rows, err = conn.Query(ctx, TopQueriesQuery, 20)
+func (nm *nodeMonitor) collectTier3TopQueries(ctx context.Context, conn *pgx.Conn, dbname string, snap *Tier3Snapshot) {
+	rows, err := conn.Query(ctx, TopQueriesQuery, 20)
 	if err != nil {
-		nm.logger.Debug().Err(err).Msg("pg_stat_statements not available")
-	} else {
-		for rows.Next() {
-			var q TopQuery
-			if err := rows.Scan(
-				&q.QueryID, &q.Query, &q.Calls,
-				&q.TotalTimeMs, &q.MeanTimeMs, &q.Rows,
-				&q.SharedBlksHit, &q.SharedBlksRead,
-			); err != nil {
-				rows.Close()
-				break
-			}
-			total := q.SharedBlksHit + q.SharedBlksRead
-			if total > 0 {
-				q.HitRatio = float64(q.SharedBlksHit) / float64(total)
-			}
-			snap.TopQueries = append(snap.TopQueries, q)
-		}
-		rows.Close()
+		nm.logger.Debug().Err(err).Str("database", dbname).Msg("pg_stat_statements not available")
+		return
 	}
-
-	nm.mu.Lock()
-	nm.tier3 = &snap
-	nm.tier3Ring = appendRing(nm.tier3Ring, snap, tier3RingCap)
-	nm.mu.Unlock()
-	return nil
+	for rows.Next() {
+		var q TopQuery
+		if err := rows.Scan(
+			&q.QueryID, &q.Query, &q.Calls,
+			&q.TotalTimeMs, &q.MeanTimeMs, &q.Rows,
+			&q.SharedBlksHit, &q.SharedBlksRead,
+		); err != nil {
+			rows.Close()
+			return
+		}
+		q.Database = dbname
+		total := q.SharedBlksHit + q.SharedBlksRead
+		if total > 0 {
+			q.HitRatio = float64(q.SharedBlksHit) / float64(total)
+		}
+		snap.TopQueries = append(snap.TopQueries, q)
+	}
+	rows.Close()
 }
 
 // ---------------------------------------------------------------------------

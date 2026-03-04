@@ -85,9 +85,9 @@ func TestValidateCluster(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "missing id",
+			name:    "missing id is ok (auto-generated)",
 			cluster: Cluster{Name: "x", Nodes: []Node{{ID: "n", Host: "h", Port: 5432}}},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "missing name",
@@ -105,9 +105,9 @@ func TestValidateCluster(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "node missing id",
+			name:    "node missing id is ok (auto-generated)",
 			cluster: Cluster{ID: "x", Name: "x", Nodes: []Node{{Host: "h", Port: 5432}}},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "node missing host",
