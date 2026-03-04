@@ -1,5 +1,5 @@
 # Go binary
-pgmanager
+/pgmanager
 
 # Embedded SPA build output (rebuilt by make web-build / Dockerfile)
 internal/server/dist/
